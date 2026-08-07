@@ -1,0 +1,19 @@
+[project]
+name = "google-search-mcp"
+version = "0.1.0"
+description = "MCP tools over Google Search through a dedicated logged-in browser profile: personalized organic results, ads stripped, the full advanced-operator surface, and pagination"
+requires-python = ">=3.12"
+dependencies = [
+    "typer>=0.12",
+    "mcp>=2.0.0",        # 2.0.0 removed mcp.server.fastmcp; server is on MCPServer now
+    "playwright>=1.44",  # not optional here: the browser IS the transport
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+gsearch = "google_search_mcp.cli:app"
+
+[tool.uv]
+package = false
