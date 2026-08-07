@@ -1,5 +1,12 @@
 .session/
 out/
+
+# Account credentials. Never commit these -- the search profiles are signed into real
+# Google accounts and the password is the whole account, not just this tool.
+esinecanagent.txt
+*.credentials
+*credentials*.txt
+*password*.txt
 __pycache__/
 *.pyc
 .venv/
