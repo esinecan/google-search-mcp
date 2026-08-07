@@ -60,6 +60,9 @@ def search(
     personalized: bool = typer.Option(True, help="--no-personalized sends pws=0"),
     verbatim: bool = typer.Option(False, help="no synonyms or stemming (tbs li:1)"),
     strict_dates: bool = typer.Option(False, help="before/after as Tools>Custom range, not operators"),
+    with_content: bool = typer.Option(False, help="also read the top results as markdown"),
+    content_top_n: int = typer.Option(3, help="how many results to read"),
+    content_chars: int = typer.Option(2000, help="markdown budget per page"),
 ) -> None:
     """One query, ads stripped, full operator surface."""
     try:
@@ -69,8 +72,23 @@ def search(
                 exclude=exclude, before=before, after=after, lang=lang,
                 country=country, freshness=freshness, vertical=vertical,
                 personalized=personalized, verbatim=verbatim, strict_dates=strict_dates,
+                with_content=with_content, content_top_n=content_top_n,
+                content_chars=content_chars,
             )
         )
+    except GoogleError as exc:
+        _emit(exc.as_result())
+        raise typer.Exit(1)
+
+
+@app.command()
+def fetch(
+    urls: list[str],
+    max_chars: int = typer.Option(2000, help="markdown budget per page"),
+) -> None:
+    """Read pages as markdown through the warmed browser. Boilerplate stripped."""
+    try:
+        _emit(client.fetch(urls, max_chars=max_chars))
     except GoogleError as exc:
         _emit(exc.as_result())
         raise typer.Exit(1)

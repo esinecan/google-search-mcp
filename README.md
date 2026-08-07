@@ -63,8 +63,39 @@ As an MCP server (stdio): `python -m google_search_mcp.mcp_server`
 |---|---|
 | `google_search` | one query, ads stripped, full operator surface, every vertical |
 | `google_multi_search` | several queries through one warmed browser — **the compound tool** |
+| `google_fetch` | read pages as markdown through the logged-in browser |
 | `google_ai_mode` | Google's AI Mode answer + citations. **Unreliable — see below** |
 | `google_session_status` | whether the profile is signed in, and as whom |
+
+### Reading pages
+
+`google_search(..., with_content=True)` attaches the top results' article text as markdown,
+and `google_fetch` does it for arbitrary URLs. Both go through the same warmed, logged-in
+Chrome, which is the point: **it reads JS-rendered apps, soft paywalls and cookie-walled
+articles that a plain HTTP fetch cannot.** For a static public page an ordinary fetch is
+cheaper and you should use one.
+
+The browser renders; [trafilatura](https://trafilatura.readthedocs.io/) strips the
+boilerplate. Nav, footers, cookie banners and related-story rails go; headings, lists,
+tables and code fences survive. Markdown rather than plain text because on a technical page
+the structure carries most of the meaning, and it still costs far fewer tokens than the HTML.
+
+Measured 2026-08-07, whole article against the raw DOM it came from:
+
+| page | raw HTML | markdown | |
+|---|---|---|---|
+| `blog.cloudflare.com/mcp-v2` | 615,709 | 18,093 | **2.9%** |
+| `modelcontextprotocol.io` spec | 294,995 | 4,708 | **1.6%** |
+
+Roughly a 30–60× reduction before truncation even applies.
+
+**There is no cached copy to read instead.** Google retired its page cache on 2 Feb 2024 —
+`cache:` and `webcache.googleusercontent.com` are both gone. The Wayback Machine is the only
+general cache left and it is the wrong source here: it would serve months-old text to a tool
+whose entire edge is recency. Live fetch is fresher *and* more capable.
+
+Bounded by default (3 results, 2000 chars each, 5 URLs per `google_fetch`) because unbounded
+this is a crawler, and each page is a real load — budget a few seconds per result.
 
 ### Verticals
 

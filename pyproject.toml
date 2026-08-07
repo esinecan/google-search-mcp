@@ -5,8 +5,9 @@ description = "MCP tools over Google Search through a dedicated logged-in browse
 requires-python = ">=3.12"
 dependencies = [
     "typer>=0.12",
-    "mcp>=2.0.0",        # 2.0.0 removed mcp.server.fastmcp; server is on MCPServer now
-    "playwright>=1.44",  # not optional here: the browser IS the transport
+    "mcp>=2.0.0",          # 2.0.0 removed mcp.server.fastmcp; server is on MCPServer now
+    "playwright>=1.44",    # not optional here: the browser IS the transport
+    "trafilatura>=2.0",    # boilerplate removal for with_content; see client.py
 ]
 
 [project.optional-dependencies]

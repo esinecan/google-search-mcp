@@ -60,6 +60,13 @@ RESULTS_PER_PAGE = 10  # Google stopped honouring num= on 11 Sept 2025. Depth co
 MAX_PAGES = 5
 MAX_SNIPPET = 400
 
+# Page-content budgets. Up here rather than beside the fetch code because `search` takes
+# them as default arguments, and defaults are bound at definition time.
+CONTENT_DEFAULT_CHARS = 2000
+CONTENT_MAX_CHARS = 20000
+CONTENT_DEFAULT_TOP_N = 3
+CONTENT_MAX_TOP_N = 5
+
 FRESHNESS = {
     "hour": "qdr:h",
     "day": "qdr:d",
@@ -479,6 +486,9 @@ def search(
     personalized: bool = True,
     verbatim: bool = False,
     strict_dates: bool = False,
+    with_content: bool = False,
+    content_top_n: int = CONTENT_DEFAULT_TOP_N,
+    content_chars: int = CONTENT_DEFAULT_CHARS,
 ) -> dict:
     """One query.
 
@@ -486,6 +496,11 @@ def search(
     of the `before:`/`after:` query operators. Both are real and both were measured; the
     operators filter on the document date Google infers, the range filter on its own index.
     One pair of arguments drives both so there is never a question of which dates won.
+
+    `with_content` reads the top `content_top_n` results as markdown, in the same warmed
+    browser, and attaches each to its result. Bounded by default on purpose: unbounded it
+    is a crawler, and ten pages of article text is a bigger payload than most questions are
+    worth. Each page costs a real page load, so budget a few seconds per result.
     """
     pages = max(1, min(int(pages), MAX_PAGES))
     vertical = vertical or "web"
@@ -544,6 +559,20 @@ def search(
             if len(data["organic"]) < RESULTS_PER_PAGE - 2:
                 break
 
+        # Content last, and inside the same browser-thread call: every SERP page is already
+        # collected, so navigating away costs nothing, and this avoids re-entering the
+        # single browser thread (which would deadlock on itself).
+        if with_content:
+            n = max(1, min(int(content_top_n), CONTENT_MAX_TOP_N))
+            for item in results[:n]:
+                got = _fetch_one(item["url"], content_chars)
+                item["content"] = got.get("markdown") if got.get("ok") else None
+                if not got.get("ok"):
+                    item["content_error"] = got.get("error")
+                elif got.get("truncated"):
+                    item["content_truncated"] = True
+                    item["content_chars_total"] = got.get("chars_total")
+
         return {
             "query": q,
             "vertical": vertical,
@@ -553,6 +582,109 @@ def search(
             "total_matches": (stats or {}).get("total"),
             "count": len(results),
             "results": results,
+        }
+
+    return _session.in_browser_thread(_work)
+
+
+# --- Page content --------------------------------------------------------------------
+#
+# The one thing neither the harness WebSearch nor the Brave API can do on this box: read
+# the page through a warmed, logged-in Chrome. JS-rendered SPAs, soft paywalls and
+# anything gated behind a Google login are all readable here and are not readable by a
+# plain HTTP fetch.
+#
+# **Google's cache is not an option and never was.** It was retired 2 Feb 2024 -- `cache:`
+# and webcache.googleusercontent.com are both gone (recorded in API.md's intent map). The
+# Wayback Machine is the only real cache left, and it is the wrong source for a tool whose
+# entire edge is recency: it would serve months-old text for a `freshness='day'` query.
+# Live fetch through the browser we already have is both fresher and more capable.
+#
+# Splitting the work: the browser renders (JS, cookies, login), trafilatura strips the
+# boilerplate. Boilerplate removal is a hard, well-solved problem and reimplementing it as
+# another pile of selectors here would be the same mistake as over-fitting the SERP parser.
+# Markdown rather than text because structure is most of the meaning in a technical page --
+# headings, code fences and lists survive, and it costs fewer tokens than the HTML did.
+
+def _to_markdown(html: str, url: str) -> str:
+    try:
+        import trafilatura
+    except ImportError:  # soft dependency: searching must not break because extraction is absent
+        return ""
+    return (
+        trafilatura.extract(
+            html,
+            url=url,
+            output_format="markdown",
+            include_links=True,
+            include_tables=True,
+            # Precision over recall: a short clean article beats a long one with the
+            # comment section and the "related stories" rail glued to the end.
+            favor_precision=True,
+        )
+        or ""
+    )
+
+
+def _truncate(md: str, max_chars: int) -> tuple[str, bool]:
+    """Cut on a paragraph boundary when one is close, so the tail is never half a sentence."""
+    if len(md) <= max_chars:
+        return md, False
+    cut = md[:max_chars]
+    boundary = cut.rfind("\n\n")
+    if boundary > max_chars * 0.6:
+        cut = cut[:boundary]
+    return cut.rstrip(), True
+
+
+def _fetch_one(url: str, max_chars: int) -> dict:
+    """One page to markdown. MUST run on the browser thread."""
+    max_chars = max(200, min(int(max_chars), CONTENT_MAX_CHARS))
+    if not url.lower().startswith(("http://", "https://")):
+        return {"url": url, "ok": False, "error": "not an http(s) URL"}
+
+    page = _session.get_page()
+    _throttle.wait(url)  # per-host, so a fresh host is not made to wait for Google's window
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        time.sleep(random.uniform(0.6, 1.2))  # let deferred content paint
+        html = page.content()
+    except Exception as exc:
+        # One dead link must not sink a search. Same per-item isolation as multi_search.
+        return {"url": url, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    md = _to_markdown(html, url)
+    if not md.strip():
+        return {
+            "url": url,
+            "ok": False,
+            "error": "no article content extracted (login wall, or not an article page)",
+        }
+    text, truncated = _truncate(md, max_chars)
+    return {
+        "url": url,
+        "ok": True,
+        "markdown": text,
+        "chars": len(text),
+        "chars_total": len(md),
+        "truncated": truncated,
+    }
+
+
+def fetch(urls: list[str], max_chars: int = CONTENT_DEFAULT_CHARS) -> dict:
+    """Read pages as markdown through the warmed browser.
+
+    Sequential and throttled per host, for the same reason `multi_search` is: this is a
+    real browser making real requests, and the polite pattern is also the unblocked one.
+    """
+    urls = list(urls)[:CONTENT_MAX_TOP_N]
+
+    def _work() -> dict:
+        pages = [_fetch_one(u, max_chars) for u in urls]
+        return {
+            "count": len(pages),
+            "ok_count": sum(1 for p in pages if p.get("ok")),
+            "pages": pages,
         }
 
     return _session.in_browser_thread(_work)

@@ -27,13 +27,15 @@ Probe scripts under the session scratchpad; numbers below are all reproducible.
 | verticals | none | news, video, image (local 500s) | ~~all broken~~ → **7 working** |
 | result count | none | none | **`total_matches`** |
 | AI answer | synthesised from results | `summarizer` — **not in our plan** | **AI Mode**, with citations |
-| page content | synthesised for you | `llm_context` — **not in our plan** | none — **still the real gap** |
+| page content | synthesised for you | `llm_context` — **not in our plan** | ~~none~~ → **markdown, through a logged-in browser** |
 | personalization | none | none | **yes, ~3.4x noise floor** |
 | ads | n/a | n/a | **stripped structurally** |
 
 Struck-through cells are what this document originally found; the arrow is where they
-landed the same day. The one row that did not move is `page content`, and it is now the
-only place either alternative does something this cannot.
+landed the same day. Every row moved. `page content` was the last one, and it closed in a
+way neither alternative can match here: WebSearch synthesises from snippets it read for
+you, Brave's `llm_context` is not in our plan, and both fetch over plain HTTP — so
+JS-rendered apps, soft paywalls and login-gated pages are simply unavailable to them.
 
 Two corrections to assumptions worth recording, because both cut against this server:
 
@@ -254,11 +256,13 @@ Done 2026-08-07:
 6. ~~AI Mode as its own tool~~ — anchored on a real container hook, absence handled as a
    normal result.
 
+7. ~~`with_content` through the warmed browser~~ — plus `google_fetch` for arbitrary URLs.
+   The browser renders, trafilatura strips boilerplate, output is markdown at **1.6–2.9% of
+   the raw HTML**. Google's cache was considered and rejected: it has not existed since
+   2 Feb 2024, and the Wayback Machine would answer recency queries with stale text.
+
 Still open:
 
-7. **`with_content` through the warmed browser** (large) — the one feature neither
-   alternative can match on this box, because a logged-in Chrome reads pages `WebFetch`
-   cannot. Unstarted.
 8. **AI Overview on the standard SERP** (medium) — distinct from AI Mode. Confirmed present
    at `#m-x-content`, 1976 chars, on informational queries only; absent on technical and
    German ones. Would need the same opt-in treatment and the same distrust.

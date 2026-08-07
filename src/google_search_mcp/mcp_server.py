@@ -73,6 +73,9 @@ def google_search(
     personalized: bool = True,
     verbatim: bool = False,
     strict_dates: bool = False,
+    with_content: bool = False,
+    content_top_n: int = 3,
+    content_chars: int = 2000,
 ) -> dict:
     """Search Google. Ads stripped; results are {rank, title, url, host, snippet, date}.
 
@@ -106,6 +109,13 @@ def google_search(
     otherwise. `total_matches` is Google's own estimate for the whole query, not the
     number returned.
 
+    `with_content=True` also READS the top `content_top_n` results and attaches each as
+    markdown on `result.content`, saving a fetch round trip per link. It goes through the
+    same logged-in browser, so it reads JS-rendered pages and soft paywalls that a plain
+    HTTP fetch cannot. Costs a real page load each -- budget a few seconds per result, and
+    raise `content_chars` (default 2000) only when you actually need the whole article.
+    A page that could not be read sets `content: null` and `content_error`.
+
     `pages` is 10 results each, max 5, and each page is a separate round trip -- ask for
     depth only when you actually need it. Ignored for `images`.
 
@@ -119,7 +129,34 @@ def google_search(
             exclude=exclude, before=before, after=after, lang=lang,
             country=country, freshness=freshness, vertical=vertical,
             personalized=personalized, verbatim=verbatim, strict_dates=strict_dates,
+            with_content=with_content, content_top_n=content_top_n,
+            content_chars=content_chars,
         )
+    except GoogleError as exc:
+        return exc.as_result()
+
+
+@mcp.tool()
+def google_fetch(urls: list[str], max_chars: int = 2000) -> dict:
+    """Read web pages as markdown, through the warmed logged-in browser.
+
+    Use this instead of a plain HTTP fetch when the page needs a real browser: JS-rendered
+    apps, soft paywalls, cookie-walled articles, anything behind the Google login. That
+    capability is the whole point -- for a static public page an ordinary fetch is cheaper.
+
+    Boilerplate (nav, footers, cookie banners, related-story rails) is stripped and only
+    the article body comes back, so the payload is a fraction of the raw HTML. Output is
+    markdown, which keeps headings, lists and code fences intact.
+
+    Capped at 5 URLs per call and read sequentially with per-host throttling -- this is a
+    real browser making real requests. `max_chars` truncates each page on a paragraph
+    boundary and sets `truncated` with the full length in `chars_total`.
+
+    A page that cannot be read comes back with `ok: false` and a reason rather than
+    sinking the call.
+    """
+    try:
+        return client.fetch(urls, max_chars=max_chars)
     except GoogleError as exc:
         return exc.as_result()
 

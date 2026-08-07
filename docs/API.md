@@ -35,7 +35,8 @@
 | restrict by freshness / vertical / region | Search (`tbs`, `tbm`, `cr`+`gl`) | mapped |
 | get results as a specific identity | Search + session profile | mapped |
 | turn personalization off | Search (`pws=0`) | mapped |
-| read the cached copy of a result | — | **explicitly unmapped**: Google retired the page cache 2 Feb 2024; `cache:` and `webcache.googleusercontent.com` are gone |
+| read the full text of a result | the result URL, in the same browser | mapped (`with_content`, `google_fetch`) |
+| read the cached copy of a result | — | **explicitly unmapped**: Google retired the page cache 2 Feb 2024; `cache:` and `webcache.googleusercontent.com` are gone. The Wayback Machine is the only general cache left and is the wrong source for a recency tool — it would answer a `freshness='day'` query with months-old text. Live fetch through the warmed browser is fresher *and* reads more (JS, soft paywalls, login-gated pages) |
 | 100 results in one request | — | **explicitly unmapped**: `num=` stopped being honoured 11 Sept 2025 |
 
 ## Search
