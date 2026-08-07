@@ -1,11 +1,12 @@
 """The closed error taxonomy.
 
-Paradigm §3.1: an agent cannot branch on prose. Four kinds, four behaviours, one stable
+Paradigm §3.1: an agent cannot branch on prose. Five kinds, five behaviours, one stable
 field name (`kind`) that every failing tool result carries.
 
     auth_expired   stop, surface the login. never retry
     schema_drift   stop, the tool is broken. never retry. flag stale
     rate_limited   back off and retry -- inside the wrapper, not in the agent
+    bad_argument   stop, fix the call. never retry unchanged
     empty          NOT an error. it is the answer, and it is returned as a normal result
 
 `empty` deliberately has no exception class. A search that matches nothing returns
@@ -44,6 +45,18 @@ class SchemaDrift(GoogleError):
     """
 
     kind = "schema_drift"
+
+
+class BadArgument(GoogleError, ValueError):
+    """An argument this tool cannot act on -- an unknown vertical, an invalid freshness.
+
+    Distinct from the other three because the fix is in the *call*, not in the tool and not
+    in the pacing: retrying unchanged can never succeed, and neither can waiting. It
+    subclasses ValueError as well so the pure functions stay usable, and testable, as plain
+    Python outside any MCP framing.
+    """
+
+    kind = "bad_argument"
 
 
 class RateLimited(GoogleError):

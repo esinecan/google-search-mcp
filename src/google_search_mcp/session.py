@@ -282,12 +282,21 @@ def shutdown() -> None:
         in_browser_thread(_work)
 
 
-def login(profile: str = DEFAULT_PROFILE) -> dict:
-    """Interactive by design. Opens a real window and blocks until it is closed.
+def login(profile: str = DEFAULT_PROFILE, timeout: float = 600.0) -> dict:
+    """Interactive by design. Opens a real window; closes itself once you are signed in.
 
     Never call this from the MCP server. A tool that blocks for minutes, and whose failure
     looks like a timeout instead of a missing login, gets debugged in the wrong place --
     the doctolib lesson, and it applies unchanged here.
+
+    The first version waited on `page.wait_for_event("close")` and nothing else, so a
+    successful sign-in produced no acknowledgement at all: the window just sat there until
+    the human guessed they were done. Hit for real 2026-08-07. It now watches for the
+    session cookie, confirms which account landed, and closes -- so the success case ends
+    on its own and the return value says who you are, rather than only where the profile is.
+
+    Closing the window by hand still works and still returns; it is the fallback path, not
+    the happy one.
     """
     from playwright.sync_api import sync_playwright
 
@@ -298,24 +307,48 @@ def login(profile: str = DEFAULT_PROFILE) -> dict:
     except ImportError:
         cm = sync_playwright()
 
+    account = None
     with cm as pw:
         kw = _launch_kwargs(profile, headless=False)
         kw["args"] = [a for a in kw["args"] if not a.startswith("--window-position")]
         try:
             ctx = pw.chromium.launch_persistent_context(**kw)
-        except Exception:
+        except Exception as first:
+            if _is_profile_lock(first):
+                raise _locked(profile) from first
             kw.pop("channel", None)
             ctx = pw.chromium.launch_persistent_context(**kw)
 
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto("https://accounts.google.com/", wait_until="domcontentloaded")
-        try:
-            page.wait_for_event("close", timeout=0)
-        except Exception:
-            pass
+
+        # `SID` only lands after the whole flow completes, 2FA included, so it is a
+        # truthful "done" signal rather than "the form was submitted".
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if page.is_closed():
+                    break  # closed by hand; fall through and report whatever we can
+                cookies = ctx.cookies("https://www.google.com/")
+            except Exception:
+                break
+            if any(c.get("name") in ("SID", "__Secure-1PSID") for c in cookies):
+                time.sleep(2.0)  # let the redirect settle before reading the account
+                try:
+                    account = read_account(page)
+                except Exception:
+                    account = None
+                break
+            time.sleep(2.0)
+
         try:
             ctx.close()
         except Exception:
             pass
 
-    return {"profile": profile, "profile_dir": str(profile_dir(profile))}
+    return {
+        "profile": profile,
+        "profile_dir": str(profile_dir(profile)),
+        "signed_in": bool(account),
+        "account": account,
+    }

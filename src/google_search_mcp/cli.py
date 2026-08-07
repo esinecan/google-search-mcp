@@ -22,13 +22,19 @@ def _emit(payload) -> None:
 
 @app.command()
 def login() -> None:
-    """Open a window and sign in once. Blocks until you close the window."""
+    """Open a window and sign in once. Closes itself when the sign-in lands."""
     typer.echo("Opening a window on the dedicated profile.")
-    typer.echo("Sign in to the account you want searches personalized to, then close it.")
+    typer.echo("Sign in to the account you want searches personalized to.")
+    typer.echo("The window closes on its own once you are signed in; closing it by hand also works.")
     typer.echo("")
     typer.echo("  This profile is separate from your Chrome, so Chrome's /u/0 default")
     typer.echo("  does not apply -- whatever you sign in as here is what gets used.")
-    _emit(session.login())
+    result = session.login()
+    if result["signed_in"]:
+        typer.echo(f"\nSigned in as {result['account']}.")
+    else:
+        typer.echo("\nNo session detected. Re-run and complete the sign-in, or check `cli status`.")
+    _emit(result)
 
 
 @app.command()
@@ -49,9 +55,11 @@ def search(
     after: str = typer.Option(None, help="after:YYYY-MM-DD"),
     lang: str = typer.Option(None, help="hl, e.g. en / de"),
     country: str = typer.Option(None, help="two-letter, e.g. de"),
-    freshness: str = typer.Option(None, help="day|week|month|year"),
-    vertical: str = typer.Option("web", help="web|news|images|videos|shopping"),
+    freshness: str = typer.Option(None, help="hour|day|week|month|year"),
+    vertical: str = typer.Option("web", help="web|web_only|news|videos|short_videos|books|images"),
     personalized: bool = typer.Option(True, help="--no-personalized sends pws=0"),
+    verbatim: bool = typer.Option(False, help="no synonyms or stemming (tbs li:1)"),
+    strict_dates: bool = typer.Option(False, help="before/after as Tools>Custom range, not operators"),
 ) -> None:
     """One query, ads stripped, full operator surface."""
     try:
@@ -60,9 +68,23 @@ def search(
                 query, pages=pages, site=site, filetype=filetype, exact=exact,
                 exclude=exclude, before=before, after=after, lang=lang,
                 country=country, freshness=freshness, vertical=vertical,
-                personalized=personalized,
+                personalized=personalized, verbatim=verbatim, strict_dates=strict_dates,
             )
         )
+    except GoogleError as exc:
+        _emit(exc.as_result())
+        raise typer.Exit(1)
+
+
+@app.command("ai-mode")
+def ai_mode(
+    query: str,
+    lang: str = typer.Option(None, help="hl, e.g. en / de"),
+    country: str = typer.Option(None, help="two-letter, e.g. de"),
+) -> None:
+    """Google's AI Mode answer. Hit or miss and not authoritative -- read the citations."""
+    try:
+        _emit(client.ai_mode(query, lang=lang, country=country))
     except GoogleError as exc:
         _emit(exc.as_result())
         raise typer.Exit(1)
