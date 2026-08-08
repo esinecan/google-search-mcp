@@ -1,6 +1,7 @@
 """MCP server over Google Search, through a dedicated logged-in browser profile.
 
-Run:  python -m google_search_mcp.mcp_server   (stdio)
+Run:  gsearch-mcp                              (stdio; installed console script)
+      python -m google_search_mcp.mcp_server   (stdio; from a checkout)
 
 Everything here reads. There is no write path and no binding action, so unlike doctolib
 this needs no confirm-gate and no safety.md.
@@ -37,11 +38,12 @@ from typing import Optional
 from mcp.server import MCPServer
 
 from . import client, session
+from . import __version__
 from .errors import GoogleError
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-mcp = MCPServer("google-search")
+mcp = MCPServer("google-search", version=__version__)
 
 
 @mcp.tool()
@@ -214,5 +216,16 @@ def google_multi_search(
     return client.multi_search(list(queries), pages=pages, personalized=personalized)
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Entry point for the `gsearch-mcp` console script.
+
+    Exists as a named function rather than only a `__main__` guard because a console script
+    imports the module and calls a callable -- a bare `if __name__ == "__main__"` never
+    fires down that path, and the failure is a server that starts and immediately exits
+    with no output at all.
+    """
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

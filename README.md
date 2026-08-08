@@ -3,10 +3,11 @@
 MCP tools over Google Search, through a dedicated logged-in browser profile. Personalized
 organic results, ads stripped, the full advanced-operator surface, and pagination.
 
-Built as the first vertical slice of the `site-as-tool` paradigm
-(`~/agent-personal-space/drafts/site-as-tool-paradigm.md`). Same three-layer shape as
-`apthunt` and `doctolib-mcp`: all site knowledge in `client.py`, a CLI that mirrors the tools
-1:1 as the debugging surface, and a thin MCP wrapper.
+Published on PyPI as **`gsearch-mcp`** (`google-search-mcp` was already taken, by an
+unrelated Custom Search API wrapper). Import package and repo keep the longer name.
+
+Three-layer shape: all site knowledge in `client.py`, a CLI that mirrors the tools 1:1 as the
+debugging surface, and a thin MCP wrapper.
 
 ## Why this exists
 
@@ -35,29 +36,90 @@ What you get that a keyword search API does not:
 
 ## Setup
 
+No checkout needed. Sign in once, then point your MCP client at it.
+
 ```
-uv venv --python 3.12
-uv pip install -e ".[dev]" playwright-stealth
-.venv/Scripts/python.exe -m google_search_mcp.cli login
+uvx --from gsearch-mcp gsearch login
 ```
 
-`login` opens a window. Sign in to the account you want searches personalized to, then close
-the window. **This profile is separate from your Chrome**, so Chrome's `/u/0` default does not
-apply — whatever you sign in as here is what gets used, deliberately. Check with
-`cli status`, which reads the account off the page rather than assuming it.
+`login` opens a window; it downloads a browser first if you have neither Chrome nor
+Playwright's Chromium. Sign in to the account you want searches personalized to. The window
+closes itself once the sign-in lands. **This profile is separate from your Chrome**, so
+Chrome's `/u/0` default does not apply — whatever you sign in as here is what gets used,
+deliberately. Check with `uvx --from gsearch-mcp gsearch status`, which reads the account off
+the page rather than assuming it.
 
 Signed out still works; it just returns the neutral, unpersonalized view.
+
+Then, in your MCP client's config:
+
+```json
+{
+  "mcpServers": {
+    "google-search": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["gsearch-mcp"]
+    }
+  }
+}
+```
+
+That entry is the same on every OS. Nothing in it is a path.
+
+### Bring your own account
+
+There is no API key. The credential is a Google account you sign into once, and the tool
+uses whatever that is — so results are personalized to *your* history, not to a service
+account's. Run `gsearch login` again to switch accounts.
+
+Several agents on one box each want their own profile, because Chromium takes an exclusive
+lock on a profile directory and two agents sharing one will collide:
+
+```
+GOOGLE_MCP_PROFILE=agent  uvx --from gsearch-mcp gsearch login
+```
+
+then set `"env": {"GOOGLE_MCP_PROFILE": "agent"}` on that client's server entry.
+
+### Environment
+
+| var | default | what it does |
+|---|---|---|
+| `GOOGLE_MCP_PROFILE` | `default` | which signed-in profile to use; one per agent |
+| `GOOGLE_MCP_SESSION_ROOT` | per-OS user data dir | where profiles live |
+| `GOOGLE_MCP_LOCALE` | the host's | browser locale, e.g. `en-US` |
+| `GOOGLE_MCP_TIMEZONE` | the host's | browser timezone, e.g. `Europe/Berlin` |
+| `GOOGLE_MCP_HEADLESS` | `0` | headless is a different fingerprint; verify against `/sorry/` before trusting it |
+| `GOOGLE_MCP_OFFSCREEN` | `1` | park the window offscreen instead of taking over the desktop |
+
+Profiles default to `%LOCALAPPDATA%\gsearch-mcp\profiles` on Windows,
+`~/Library/Application Support/gsearch-mcp/profiles` on macOS, and
+`$XDG_DATA_HOME/gsearch-mcp/profiles` on Linux. They are deliberately **not** stored next to
+the code: under `uvx` that location is rebuilt on every version bump, and a session kept
+there would vanish on upgrade and report itself as a login failure.
 
 ## Use
 
 ```
-.venv/Scripts/python.exe -m google_search_mcp.cli status
-.venv/Scripts/python.exe -m google_search_mcp.cli search "model context protocol" --site modelcontextprotocol.io
-.venv/Scripts/python.exe -m google_search_mcp.cli search "agent harness" --freshness week --no-personalized
-.venv/Scripts/python.exe -m google_search_mcp.cli multi-search "mcp spec" "mcp security" "mcp transports"
+uvx --from gsearch-mcp gsearch status
+uvx --from gsearch-mcp gsearch search "model context protocol" --site modelcontextprotocol.io
+uvx --from gsearch-mcp gsearch search "agent harness" --freshness week --no-personalized
+uvx --from gsearch-mcp gsearch multi-search "mcp spec" "mcp security" "mcp transports"
 ```
 
-As an MCP server (stdio): `python -m google_search_mcp.mcp_server`
+As an MCP server (stdio): `gsearch-mcp`.
+
+### From a checkout
+
+```
+uv venv --python 3.12
+uv pip install -e ".[dev]"
+.venv/Scripts/python.exe -m google_search_mcp.cli login
+```
+
+A checkout keeps its profiles in a repo-local `.session/` if that directory already exists,
+so an existing signed-in profile keeps working after upgrading to a packaged install.
 
 | tool | what it is for |
 |---|---|

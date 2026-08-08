@@ -1,9 +1,7 @@
 # Recon log — what was tried, and what was rejected
 
 Companion to `API.md` (the contract). This is the part that stops the next person
-re-deriving five dead ends. Dated 2026-08-07, residential consumer IP in Germany.
-
-Full measurement harness and captures: `~/dev/google-search-recon/` (`RESULT.md`, `out/`).
+re-deriving five dead ends. Dated 2026-08-07, on a residential consumer IP in Germany.
 
 ---
 
@@ -24,10 +22,10 @@ Pricing when it was open: 100 queries/day free, $5/1k, 10k/day cap.
 and every query operator are server-side.
 
 **Q3 — blast radius?** The Google account. Mitigated by a dedicated profile rather than the
-user's Chrome, which also resolves the sharper problem: local Chrome's `/u/0` on this box is
-not necessarily the account you want, so "whoever was signed in" would have run every query as
-the wrong identity and filed it in the wrong history. The profile makes the account a
-deliberate, readable decision.
+user's Chrome, which also resolves the sharper problem: the account sitting at local Chrome's
+`/u/0` is frequently not the one you want searches attributed to, so "whoever was signed in"
+runs every query as the wrong identity and files it in the wrong account's history. The
+dedicated profile makes the account a deliberate, readable decision.
 
 ## Vehicle — five attempts
 

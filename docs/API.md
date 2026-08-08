@@ -17,10 +17,10 @@
 - **Profile warming required:** **yes.** A fresh profile refuses cold direct `/search?q=`
   navigation. One organic in-page search (homepage → type → Enter) unlocks direct URLs
   permanently for that profile.
-- **Exit IP class:** **residential required.** Measured on a consumer line in Germany. VPN exits
-  CAPTCHA on every vehicle tested.
-- **Captured as identity:** `esinecan@gmail.com` (read off the page, not assumed — local Chrome's
-  `/u/0` on this box is the *persona* account and would have been the wrong default)
+- **Exit IP class:** **residential required.** Measured on a consumer line in Germany. VPN
+  exits CAPTCHA on every vehicle tested.
+- **Captured as identity:** read off the page, not assumed — the account at local Chrome's
+  `/u/0` is not reliably the one you want searches attributed to, so it is the wrong default
 - **Verified:** 2026-08-07 / live queries via the shipped client
 
 ---

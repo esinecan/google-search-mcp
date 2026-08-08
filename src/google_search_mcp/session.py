@@ -5,11 +5,11 @@ argument, and it holds here for a second reason):
 
 1. Chrome wraps its cookie store in App-Bound Encryption, so lifting the session out of
    it offline is unreliable. The answer is to not try -- own a separate profile.
-2. On this box Chrome's `/u/0` is not necessarily the account you want searches attributed to. A
-   personalized search tool built on "whoever was already signed in" would silently run
-   every query as the wrong identity and file it in the wrong account's history. A
-   dedicated profile makes the account one deliberate decision, recorded and readable
-   via `session_status()`.
+2. The account sitting at Chrome's `/u/0` is frequently not the one you want searches
+   attributed to. A personalized search tool built on "whoever was already signed in"
+   silently runs every query as the wrong identity and files it in the wrong account's
+   history. A dedicated profile makes the account one deliberate decision, recorded and
+   readable via `session_status()`.
 
 Transport findings, measured 2026-08-07 on a residential consumer IP in Germany
 (full write-up in docs/RECON.md):
@@ -38,16 +38,57 @@ from __future__ import annotations
 
 import os
 import random
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
 
-from .errors import AuthExpired, RateLimited
+from .errors import AuthExpired, RateLimited, SchemaDrift
 
-SESSION_ROOT = Path(__file__).resolve().parent.parent.parent / ".session"
+# Legacy location: repo-relative, from when this only ever ran out of a checkout.
+_LEGACY_SESSION_ROOT = Path(__file__).resolve().parent.parent.parent / ".session"
+
+
+def _default_session_root() -> Path:
+    """Where the logged-in browser profiles live.
+
+    This MUST NOT be derived from `__file__` once the package is installed rather than
+    checked out. Under `uvx` the code lives in a cached environment keyed on the resolved
+    requirement: it survives between runs, but it is rebuilt on every version bump and
+    discarded by `uv cache clean`. A Google session stored there evaporates on upgrade --
+    and the symptom is `AuthExpired`, which sends the reader looking at login rather than
+    at packaging. So: a per-OS user data directory, stable across upgrades.
+
+    The legacy repo-relative path still wins when it actually exists, which is true in a
+    development checkout and false in every installed copy. That keeps an existing signed-in
+    profile working without a config change, without pinning installed copies to a path
+    inside their own venv.
+    """
+    if override := os.environ.get("GOOGLE_MCP_SESSION_ROOT"):
+        return Path(override).expanduser()
+
+    if _LEGACY_SESSION_ROOT.is_dir():
+        return _LEGACY_SESSION_ROOT
+
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+    return base / "gsearch-mcp" / "profiles"
+
+
+SESSION_ROOT = _default_session_root()
 DEFAULT_PROFILE = os.environ.get("GOOGLE_MCP_PROFILE", "default")
+
+# Locale and timezone are a fingerprint, not a preference: they should look like the box
+# the browser is actually running on. Hardcoding Berlin/en-US was right for one machine and
+# wrong for a distributed one, so both are overridable and both default to the system.
+LOCALE = os.environ.get("GOOGLE_MCP_LOCALE") or None
+TIMEZONE = os.environ.get("GOOGLE_MCP_TIMEZONE") or None
 
 # Headful by default and deliberately. Headless is a different fingerprint and was not the
 # configuration the transport findings above were measured on. The window is parked far
@@ -87,17 +128,22 @@ def _launch_kwargs(profile: str, headless: bool) -> dict:
         # Far offscreen rather than minimised: minimised windows get throttled timers,
         # which makes page loads flaky. Offscreen keeps it a normal foregroundable window.
         args.append("--window-position=-2400,-2400")
-    return {
+    kw = {
         "user_data_dir": str(profile_dir(profile)),
         "headless": headless,
         "channel": "chrome",
-        "locale": "en-US",
-        "timezone_id": "Europe/Berlin",
         "no_viewport": True,
         "args": args,
         # The load-bearing line. See module docstring.
         "ignore_default_args": ["--enable-automation"],
     }
+    # Omitted rather than defaulted: Playwright then inherits the host's own locale and
+    # timezone, which is the consistent fingerprint. Set them only to override.
+    if LOCALE:
+        kw["locale"] = LOCALE
+    if TIMEZONE:
+        kw["timezone_id"] = TIMEZONE
+    return kw
 
 
 def _new_playwright():
@@ -139,17 +185,85 @@ def _ensure_browser(profile: str = DEFAULT_PROFILE):
         except Exception as second:
             if _is_profile_lock(second):
                 raise _locked(profile) from second
+            if _is_missing_browser(second):
+                raise _missing_browser() from second
             raise
 
     _page = _ctx.pages[0] if _ctx.pages else _ctx.new_page()
     return _page
 
 
+def _is_missing_browser(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "executable doesn't exist" in msg or "playwright install" in msg
+
+
+def _missing_browser() -> SchemaDrift:
+    """No usable browser: neither system Chrome nor a downloaded Chromium.
+
+    Filed under `schema_drift` rather than a sixth error kind. The taxonomy is closed on
+    purpose, and schema_drift's contract -- stop, the instrument is unusable, never retry,
+    needs a human -- is exactly right here. What it must not be is `rate_limited`, which
+    would have an agent politely backing off and retrying forever against a binary that is
+    never going to appear on its own.
+    """
+    return SchemaDrift(
+        "No usable browser. This tool drives a real browser, so it needs either Google "
+        "Chrome installed system-wide (preferred: it is the configuration the transport "
+        "was measured on) or Playwright's bundled Chromium downloaded once. Fix with:\n"
+        "    uvx --from gsearch-mcp gsearch login\n"
+        "which downloads Chromium if it is missing and then signs you in."
+    )
+
+
+def ensure_browser_binary(quiet: bool = False) -> bool:
+    """Download Playwright's Chromium if no browser is available. Returns True if it ran.
+
+    Only called from `login` -- a one-time, human-present, interactive command. Deliberately
+    NOT called from the server: a ~150MB download inside a tool call is indistinguishable
+    from a hang, and an agent that hits it has no way to report progress.
+    """
+    import subprocess
+
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as pw:
+        for get in (lambda: pw.chromium.executable_path, lambda: None):
+            try:
+                if get() and Path(get()).exists():
+                    return False
+            except Exception:
+                break
+        try:
+            # A system Chrome makes the bundled download unnecessary.
+            b = pw.chromium.launch(channel="chrome", headless=True)
+            b.close()
+            return False
+        except Exception:
+            pass
+
+    if not quiet:
+        print("No browser found. Downloading Playwright's Chromium (one time, ~150MB)...")
+    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+    return True
+
+
 def _is_profile_lock(exc: Exception) -> bool:
     msg = str(exc).lower()
     return any(
         s in msg
-        for s in ("singletonlock", "profile appears to be in use", "cannot create a new browser", "failed to create")
+        for s in (
+            "singletonlock",
+            "profile appears to be in use",
+            "cannot create a new browser",
+            "failed to create",
+            # Real Chrome (channel="chrome") does not report the lock as an error at all:
+            # it hands the URL to the instance that already owns the profile, prints this,
+            # and exits 0. Playwright then fails on a browser that vanished, and without
+            # this line the user gets a 60-line launch-args dump instead of "it's locked".
+            # Hit 2026-08-08 the first time two agents shared a profile on this box.
+            "opening in existing browser session",
+        )
     )
 
 
@@ -174,20 +288,83 @@ def _blocked(page) -> bool:
     return "/sorry/" in page.url
 
 
+# Reject-all, per locale. Only the reject variant is ever clicked: this is a consent
+# decision made on someone else's behalf, so the privacy-preserving branch is the only one
+# the tool is allowed to take. If none of these match, we do NOT fall back to "click the
+# first button in the dialog" -- on Google's consent page that button is often Accept all.
+_CONSENT_REJECT_LABELS = (
+    "Reject all",           # en
+    "Alle ablehnen",        # de
+    "Tout refuser",         # fr
+    "Rechazar todo",        # es
+    "Rifiuta tutto",        # it
+    "Alles afwijzen",       # nl
+    "Rejeitar tudo",        # pt
+    "Odrzuć wszystko",      # pl
+    "Tümünü reddet",        # tr
+    "Avvisa alla",          # sv
+    "Afvis alle",           # da
+    "Avvis alle",           # no
+    "Hylkää kaikki",        # fi
+    "Odmítnout vše",        # cs
+    "Odmietnuť všetko",     # sk
+    "Az összes elutasítása",  # hu
+    "Refuzați tot",         # ro
+    "Απόρριψη όλων",        # el
+    "Отхвърляне на всичко",  # bg
+    "Odbij sve",            # hr
+    "Zavrni vse",           # sl
+    "Atmesti viską",        # lt
+    "Noraidīt visu",        # lv
+    "Lükka kõik tagasi",    # et
+)
+
+
+def _consent_present(page) -> bool:
+    """Is the consent interstitial still up? Checked by URL and by the form Google posts."""
+    try:
+        if "consent.google." in page.url:
+            return True
+        return page.locator('form[action*="consent"], div[aria-modal="true"]').count() > 0
+    except Exception:
+        return False
+
+
+def _dismiss_consent(page) -> None:
+    """Click reject-all if the EU consent interstitial is up.
+
+    Silent when there is no dialog, which is the non-EU case and most of the world. When a
+    dialog IS up and no label matches, that is a stale extractor -- the same class of
+    failure as SERP markup drift -- so it is reported as such rather than left to surface
+    later as a search-box timeout, which reads as anti-bot and sends the reader to the
+    wrong place entirely.
+    """
+    for label in _CONSENT_REJECT_LABELS:
+        try:
+            btn = page.get_by_role("button", name=label, exact=False)
+            if btn.count():
+                btn.first.click(timeout=4000)
+                time.sleep(random.uniform(1.2, 2.0))
+                return
+        except Exception:
+            continue
+
+    if _consent_present(page):
+        raise SchemaDrift(
+            "Google's consent interstitial is up and no known reject-all label matched, so "
+            "the profile cannot be warmed. This is a locale gap, not a block: add this "
+            "locale's reject-all label to _CONSENT_REJECT_LABELS in session.py. Workaround "
+            "in the meantime: run `gsearch login` and dismiss the dialog by hand once, or "
+            "set GOOGLE_MCP_LOCALE=en-US."
+        )
+
+
 def _warm(page) -> bool:
     """Unlock direct /search navigation on this profile. Idempotent, cheap after the first."""
     page.goto("https://www.google.com/", wait_until="domcontentloaded", timeout=45000)
     time.sleep(random.uniform(1.5, 2.5))
 
-    for label in ("Reject all", "Alle ablehnen"):
-        try:
-            btn = page.get_by_role("button", name=label)
-            if btn.count():
-                btn.first.click(timeout=4000)
-                time.sleep(random.uniform(1.2, 2.0))
-                break
-        except Exception:
-            continue
+    _dismiss_consent(page)
 
     try:
         box = page.locator('textarea[name="q"], input[name="q"]').first
@@ -299,6 +476,10 @@ def login(profile: str = DEFAULT_PROFILE, timeout: float = 600.0) -> dict:
     the happy one.
     """
     from playwright.sync_api import sync_playwright
+
+    # The one place a browser download is allowed to happen: interactive, human present,
+    # once per box. Everywhere else a missing browser is an error with instructions.
+    ensure_browser_binary()
 
     try:
         from playwright_stealth import Stealth
