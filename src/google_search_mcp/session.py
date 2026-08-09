@@ -97,6 +97,12 @@ TIMEZONE = os.environ.get("GOOGLE_MCP_TIMEZONE") or None
 HEADLESS = os.environ.get("GOOGLE_MCP_HEADLESS", "0") == "1"
 OFFSCREEN = os.environ.get("GOOGLE_MCP_OFFSCREEN", "1") == "1"
 
+# Off by default, and the default is the measured one. See `_new_playwright`: against real
+# Chrome, playwright-stealth empties `navigator.userAgentData.brands`, and an empty brands
+# array is a sharper bot tell than anything stealth hides. Kept as an opt-in because the
+# bundled-Chromium fallback is a different vehicle and was never re-measured without it.
+STEALTH = os.environ.get("GOOGLE_MCP_STEALTH", "0") == "1"
+
 # One thread owns the browser. See module docstring.
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gsearch-browser")
 _lock = threading.Lock()
@@ -147,21 +153,37 @@ def _launch_kwargs(profile: str, headless: bool) -> dict:
 
 
 def _new_playwright():
-    """Start Playwright, with stealth applied when it is installed.
+    """Start Playwright. Stealth is opt-in via GOOGLE_MCP_STEALTH=1.
 
-    Stealth is belt-and-braces, not the fix: the automation flag was the measured tell and
-    stealth alone did not defeat it. Kept because every passing run had it applied, and a
-    search tool is the wrong place to find out which of two changes mattered.
+    It used to be applied whenever installed, on the reasoning that stealth was
+    belt-and-braces and every passing run had it. Measured against real Chrome 151 with
+    playwright-stealth 2.0.3, that reasoning inverted. Same profile, same launch kwargs,
+    only stealth differing:
+
+        stealth off  navigator.userAgentData.brands =
+                     [Not=A?Brand 99, Google Chrome 151, Chromium 151]
+        stealth on   navigator.userAgentData.brands = []
+
+    Real Chrome always populates brands, so an empty array is not concealment, it is a
+    declaration. The automation-flag strip is the change that was actually measured to
+    defeat the interstitial and it carries the load on its own.
     """
+    cm = _playwright_cm()
+    return cm, cm.__enter__()
+
+
+def _playwright_cm():
+    """The Playwright context manager, unentered, so callers can `with` it themselves."""
     from playwright.sync_api import sync_playwright
 
-    try:
-        from playwright_stealth import Stealth
+    if STEALTH:
+        try:
+            from playwright_stealth import Stealth
 
-        cm = Stealth().use_sync(sync_playwright())
-    except ImportError:
-        cm = sync_playwright()
-    return cm, cm.__enter__()
+            return Stealth().use_sync(sync_playwright())
+        except ImportError:
+            pass
+    return sync_playwright()
 
 
 def _ensure_browser(profile: str = DEFAULT_PROFILE):
@@ -400,16 +422,43 @@ def get_page(profile: str = DEFAULT_PROFILE):
     return page
 
 
+# Presence of any of these on .google.com IS what signed-in means. A cookie is checked
+# rather than a rendered string because the page is localised and the string is not: the
+# avatar reads "Google Account" in English and "Google Hesabi" in Turkish, so the old
+# English-only selector reported a signed-in Turkish profile as signed out. That was not
+# merely a cosmetic status bug - `login()` derived its own success from the same selector,
+# so a sign-in that completed, cookie and all, announced itself as a failure and sent the
+# caller back to re-run a login that had already worked.
+AUTH_COOKIE_NAMES = ("SID", "__Secure-1PSID", "__Secure-3PSID", "SSID", "SAPISID")
+
+
+def has_auth_session(ctx) -> bool:
+    """Is there a live Google session in this context. Locale-independent, no page load."""
+    try:
+        names = {c.get("name") for c in ctx.cookies("https://www.google.com/")}
+    except Exception:
+        return False
+    return any(n in names for n in AUTH_COOKIE_NAMES)
+
+
 def read_account(page) -> str | None:
-    """Which account this profile is signed in as, read off the page rather than assumed."""
+    """Which address this profile is signed in as, read off the page rather than assumed.
+
+    Advisory only, and never the signed-in test. Scans every aria-label for an address
+    instead of matching one English phrase, so it survives the interface language. A None
+    means "could not read the address", which is not the same as "not signed in" -
+    `has_auth_session` is what answers that.
+    """
+    import re
+
     try:
         page.goto("https://www.google.com/", wait_until="domcontentloaded", timeout=30000)
         time.sleep(1.0)
-        el = page.query_selector('a[aria-label*="@"], [aria-label*="Google Account"]')
-        if el:
-            import re
-
-            m = re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", el.get_attribute("aria-label") or "")
+        labels = page.eval_on_selector_all(
+            "[aria-label]", "els => els.map(e => e.getAttribute('aria-label'))"
+        )
+        for lab in labels or []:
+            m = re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", lab or "")
             if m:
                 return m.group(0)
     except Exception:
@@ -420,11 +469,14 @@ def read_account(page) -> str | None:
 def status(profile: str = DEFAULT_PROFILE) -> dict:
     def _work():
         page = _ensure_browser(profile)
-        account = read_account(page)
+        signed_in = has_auth_session(page.context)
+        # Only worth a page load when there is a session to name. Skipping it when signed
+        # out also keeps `status()` from navigating on every call.
+        account = read_account(page) if signed_in else None
         return {
             "profile": profile,
             "profile_dir": str(profile_dir(profile)),
-            "signed_in": bool(account),
+            "signed_in": signed_in,
             "account": account,
             "headless": HEADLESS,
             "warmed": _warmed,
@@ -434,7 +486,12 @@ def status(profile: str = DEFAULT_PROFILE) -> dict:
         return in_browser_thread(_work)
 
 
-def require_account(profile: str = DEFAULT_PROFILE) -> str:
+def require_account(profile: str = DEFAULT_PROFILE) -> str | None:
+    """The signed-in address, or None when there is a session whose address is unreadable.
+
+    Returning None on a live session is deliberate: the gate is the session, not whether
+    the address could be scraped off a localised page.
+    """
     st = status(profile)
     if not st["signed_in"]:
         raise AuthExpired(
@@ -481,14 +538,13 @@ def login(profile: str = DEFAULT_PROFILE, timeout: float = 600.0) -> dict:
     # once per box. Everywhere else a missing browser is an error with instructions.
     ensure_browser_binary()
 
-    try:
-        from playwright_stealth import Stealth
-
-        cm = Stealth().use_sync(sync_playwright())
-    except ImportError:
-        cm = sync_playwright()
+    # Same stealth policy as `_new_playwright`, and it matters more here: signing in on a
+    # browser with an empty Client Hints brands array is how an account gets flagged before
+    # it has issued a single search.
+    cm = _playwright_cm()
 
     account = None
+    signed_in = False
     with cm as pw:
         kw = _launch_kwargs(profile, headless=False)
         kw["args"] = [a for a in kw["args"] if not a.startswith("--window-position")]
@@ -513,7 +569,8 @@ def login(profile: str = DEFAULT_PROFILE, timeout: float = 600.0) -> dict:
                 cookies = ctx.cookies("https://www.google.com/")
             except Exception:
                 break
-            if any(c.get("name") in ("SID", "__Secure-1PSID") for c in cookies):
+            if any(c.get("name") in AUTH_COOKIE_NAMES for c in cookies):
+                signed_in = True
                 time.sleep(2.0)  # let the redirect settle before reading the account
                 try:
                     account = read_account(page)
@@ -521,6 +578,12 @@ def login(profile: str = DEFAULT_PROFILE, timeout: float = 600.0) -> dict:
                     account = None
                 break
             time.sleep(2.0)
+
+        # The loop also exits when the window is closed by hand or the deadline passes,
+        # and either can happen AFTER a sign-in has already landed. Re-check the cookies
+        # rather than reporting failure on the strength of how the loop ended.
+        if not signed_in:
+            signed_in = has_auth_session(ctx)
 
         try:
             ctx.close()
@@ -530,6 +593,6 @@ def login(profile: str = DEFAULT_PROFILE, timeout: float = 600.0) -> dict:
     return {
         "profile": profile,
         "profile_dir": str(profile_dir(profile)),
-        "signed_in": bool(account),
+        "signed_in": signed_in,
         "account": account,
     }
