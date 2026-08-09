@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gsearch-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "MCP tools over Google Search through a dedicated logged-in browser profile: personalized organic results, ads stripped, the full advanced-operator surface, and pagination"
 readme = "README.md"
 license = "MIT"
