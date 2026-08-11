@@ -92,6 +92,9 @@ then set `"env": {"GOOGLE_MCP_PROFILE": "agent"}` on that client's server entry.
 | `GOOGLE_MCP_TIMEZONE` | the host's | browser timezone, e.g. `Europe/Berlin` |
 | `GOOGLE_MCP_HEADLESS` | `0` | headless is a different fingerprint; verify against `/sorry/` before trusting it |
 | `GOOGLE_MCP_OFFSCREEN` | `1` | park the window offscreen instead of taking over the desktop |
+| `GOOGLE_MCP_TRANSPORT` | `stdio` | `http` serves streamable HTTP instead; see below |
+| `GOOGLE_MCP_HTTP_HOST` | `127.0.0.1` | http transport only |
+| `GOOGLE_MCP_HTTP_PORT` | `8766` | http transport only |
 
 Profiles default to `%LOCALAPPDATA%\gsearch-mcp\profiles` on Windows,
 `~/Library/Application Support/gsearch-mcp/profiles` on macOS, and
@@ -109,6 +112,36 @@ uvx --from gsearch-mcp gsearch multi-search "mcp spec" "mcp security" "mcp trans
 ```
 
 As an MCP server (stdio): `gsearch-mcp`.
+
+### One server, many agents
+
+The profile is exclusive. Chromium takes an exclusive lock on a user-data-dir, and the
+browser is launched on first use and held until the process exits -- so under stdio, where
+every client spawns its own server, the first agent to search keeps the profile for its
+whole lifetime and every other agent gets `rate_limited`. Measured 2026-08-11: one client
+held it from 19:15 to 21:53, releasing only when that client exited.
+
+Run one server and point every client at it:
+
+```
+GOOGLE_MCP_TRANSPORT=http gsearch-mcp
+```
+
+then register it as a URL server rather than a command, e.g.
+
+```
+claude mcp add --transport http google-search http://127.0.0.1:8766/mcp
+```
+
+Funnelling concurrent callers into one process is safe by construction: every browser call
+goes through `session.in_browser_thread`, a single-worker executor, so requests queue
+instead of colliding. Verified with two simultaneous clients -- both returned results, no
+`rate_limited`, finishing at 2.0s and 7.5s. Sequential service is what the anti-bot side
+wants anyway, which is why `google_multi_search` is deliberately serial.
+
+The alternative, one profile per agent via `GOOGLE_MCP_PROFILE`, costs a `gsearch login`
+each, a browser each, and more query volume from a single exit IP -- which is what draws
+`/sorry/`.
 
 ### From a checkout
 

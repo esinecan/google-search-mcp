@@ -33,6 +33,7 @@ replaced the bundled `mcp.server.fastmcp.FastMCP`, which 2.0.0 removed.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 from mcp.server import MCPServer
@@ -223,8 +224,40 @@ def main() -> None:
     imports the module and calls a callable -- a bare `if __name__ == "__main__"` never
     fires down that path, and the failure is a server that starts and immediately exits
     with no output at all.
+
+    `GOOGLE_MCP_TRANSPORT` picks the transport, default `stdio`.
+
+    `http` exists because the browser profile is exclusive and stdio gives every client its
+    own server process. Chromium takes an exclusive lock on a user-data-dir, and the browser
+    is launched on first use and held until the process exits -- so under stdio the first
+    agent to search monopolises the profile for its whole lifetime and every other agent
+    gets `rate_limited` (see `session._locked`). Measured 2026-08-11: one Claude Code
+    session held it 19:15 to 21:53, releasing only when that session ended.
+
+    Run one server with `GOOGLE_MCP_TRANSPORT=http` and point every client at it instead.
+    Concurrent calls are already safe to funnel into one process: all browser access goes
+    through `session.in_browser_thread`, a single-worker executor, so requests queue rather
+    than collide. That also matches what Google wants -- `google_multi_search` is
+    deliberately sequential for the same anti-bot reason.
     """
-    mcp.run()
+    transport = os.environ.get("GOOGLE_MCP_TRANSPORT", "stdio").strip().lower()
+
+    if transport in ("", "stdio"):
+        mcp.run()
+        return
+
+    if transport in ("http", "streamable-http"):
+        mcp.run(
+            transport="streamable-http",
+            host=os.environ.get("GOOGLE_MCP_HTTP_HOST", "127.0.0.1"),
+            port=int(os.environ.get("GOOGLE_MCP_HTTP_PORT", "8766")),
+        )
+        return
+
+    raise SystemExit(
+        f"gsearch-mcp: unknown GOOGLE_MCP_TRANSPORT {transport!r} "
+        f"(expected 'stdio' or 'http')"
+    )
 
 
 if __name__ == "__main__":
