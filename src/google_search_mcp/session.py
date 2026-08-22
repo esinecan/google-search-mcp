@@ -113,10 +113,59 @@ _ctx: Any = None
 _page: Any = None
 _warmed = False
 
+# Set from the context's own "close" event, which fires on the Playwright connection
+# thread when the browser process dies. Read (and cleared) only on the browser thread.
+# The alternative -- discovering the death from the first failed call -- is what this
+# file did before 2026-08-23, and the failure mode was measured on this box: Chrome died
+# under a long-lived server (every stdio session, and the shared http daemon), `_ctx`
+# stayed non-None, and every call from then to process exit raised
+# "Target page, context or browser has been closed". `status()` had it worst of all:
+# `has_auth_session` swallows the dead-context exception, so a crashed browser reported
+# itself as `signed_in: false` -- a logout that never happened, sending the reader to
+# `gsearch login` for a profile that was signed in all along.
+_ctx_dead = False
+
+
+def _mark_dead(*_args) -> None:
+    global _ctx_dead
+    _ctx_dead = True
+
+
+# Playwright's transport-level death rattles. The class check is the primary signal
+# (TargetClosedError covers page/context/browser/driver death); the message markers
+# cover equivalent errors raised before a class unwrap, and "connection closed" is the
+# driver-process-died case, where no close event can ever fire.
+_DEAD_BROWSER_MARKERS = (
+    "target page, context or browser has been closed",
+    "browser has been closed",
+    "target closed",
+    "connection closed",
+)
+
+
+def _looks_like_dead_browser(exc: BaseException) -> bool:
+    if type(exc).__name__ == "TargetClosedError":
+        return True
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _DEAD_BROWSER_MARKERS)
+
 
 def in_browser_thread(fn: Callable, *args, **kwargs):
-    """Run `fn` on the thread that owns Playwright. All browser access goes through here."""
-    return _executor.submit(fn, *args, **kwargs).result()
+    """Run `fn` on the thread that owns Playwright. All browser access goes through here.
+
+    If the browser (or the Playwright driver) died under the process, `fn` raises a
+    closed-target error. Rather than letting that poison every later call, tear the
+    browser down and run `fn` once more on a fresh launch. Read-only workloads make the
+    retry safe; the alternative -- a server that stays dead until someone restarts the
+    process -- was the 2026-08-23 outage on both the stdio seats and the shared daemon.
+    """
+    try:
+        return _executor.submit(fn, *args, **kwargs).result()
+    except Exception as exc:
+        if not _looks_like_dead_browser(exc):
+            raise
+        _executor.submit(_teardown).result()
+        return _executor.submit(fn, *args, **kwargs).result()
 
 
 def profile_dir(name: str = DEFAULT_PROFILE) -> Path:
@@ -187,8 +236,16 @@ def _playwright_cm():
 
 
 def _ensure_browser(profile: str = DEFAULT_PROFILE):
-    """Lazily start the browser. MUST be called on the browser thread."""
-    global _pw_cm, _pw, _ctx, _page
+    """Lazily start the browser. MUST be called on the browser thread.
+
+    Also the recovery point when the browser died under a long-lived process: the
+    context's close event set `_ctx_dead`, so tear the corpse down and relaunch. The
+    `_warmed` reset inside `_teardown` matters -- a fresh context refuses direct /search
+    navigation until warmed again, so the flag must not survive the relaunch.
+    """
+    global _pw_cm, _pw, _ctx, _page, _ctx_dead
+    if _ctx_dead:
+        _teardown()
     if _ctx is not None:
         return _page
 
@@ -212,6 +269,11 @@ def _ensure_browser(profile: str = DEFAULT_PROFILE):
             raise
 
     _page = _ctx.pages[0] if _ctx.pages else _ctx.new_page()
+    # Fires when the browser process goes away, which is the only reliable early
+    # signal -- every later Playwright call would raise, but a probe-first design
+    # pays on every call, and `status()` would swallow the exception and lie.
+    _ctx.on("close", _mark_dead)
+    _ctx_dead = False
     return _page
 
 
@@ -501,19 +563,27 @@ def require_account(profile: str = DEFAULT_PROFILE) -> str | None:
     return st["account"]
 
 
-def shutdown() -> None:
-    def _work():
-        global _pw_cm, _pw, _ctx, _page, _warmed
-        for closer in (lambda: _ctx and _ctx.close(), lambda: _pw_cm and _pw_cm.__exit__(None, None, None)):
-            try:
-                closer()
-            except Exception:
-                pass
-        _pw_cm = _pw = _ctx = _page = None
-        _warmed = False
+def _teardown() -> None:
+    """Drop the browser and playwright handles. MUST run on the browser thread.
 
+    Takes no lock, on purpose: it is also the recovery path called from inside
+    `in_browser_thread`, where the caller may already hold `_lock` (see `status`) and a
+    lock-taking teardown would deadlock the single browser thread against its caller.
+    """
+    global _pw_cm, _pw, _ctx, _page, _warmed, _ctx_dead
+    for closer in (lambda: _ctx and _ctx.close(), lambda: _pw_cm and _pw_cm.__exit__(None, None, None)):
+        try:
+            closer()
+        except Exception:
+            pass
+    _pw_cm = _pw = _ctx = _page = None
+    _warmed = False
+    _ctx_dead = False
+
+
+def shutdown() -> None:
     with _lock:
-        in_browser_thread(_work)
+        in_browser_thread(_teardown)
 
 
 def login(profile: str = DEFAULT_PROFILE, timeout: float = 600.0) -> dict:
