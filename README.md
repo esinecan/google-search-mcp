@@ -160,7 +160,20 @@ so an existing signed-in profile keeps working after upgrading to a packaged ins
 | `google_multi_search` | several queries through one warmed browser — **the compound tool** |
 | `google_fetch` | read pages as markdown through the logged-in browser |
 | `google_ai_mode` | Google's AI Mode answer + citations. **Unreliable — see below** |
-| `google_session_status` | whether the profile is signed in, and as whom |
+| `google_session_status` | whether the profile is signed in, and as whom; the poll surface for a started login |
+| `google_initiate_login` | ⚠️ opens a sign-in window on the user's screen and returns immediately. Attended contexts only |
+
+`google_initiate_login` is `gsearch login` reached from an agent: it spawns that same command
+as a detached child and returns a state in under a second, because a tool call that waits for
+a person to type a password and a 2FA code is indistinguishable, from the agent's side, from a
+hung server. Poll `google_session_status` for the outcome — `login_in_progress`, then
+`signed_in` or `signed_out`. It is single-flighted, so a second call reports the first rather
+than opening a second window.
+
+The cost to know before calling it: **while that window is open, every search on the box is
+paused.** Chromium locks a profile directory exclusively, so the server has to let go of the
+browser for the login window to take it, and one server backs every agent session (below). All
+four search tools return `rate_limited` until the login finishes or is abandoned.
 
 ### Reading pages
 
@@ -269,6 +282,10 @@ Environment: `GOOGLE_MCP_PROFILE` (default `default`), `GOOGLE_MCP_HEADLESS` (de
 Failing results carry a `kind` field (paradigm §3.1): `auth_expired` (sign in, never retry),
 `schema_drift` (extractor stale, never retry, flag it), `rate_limited` (back off),
 `bad_argument` (fix the call, never retry unchanged).
+
+`auth_expired` also carries its remedy as a field rather than as prose to be regex'd —
+`detail.login_tool: "google_initiate_login"`. Staying strict about auth (never falling back,
+never silently driving a browser) only stays useful if the envelope names the next move.
 
 `empty` is **not** an error — a query matching nothing returns `count: 0` with no `kind`.
 Neither is an absent AI Mode answer, which returns `available: false` with a reason.

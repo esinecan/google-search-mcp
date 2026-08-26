@@ -21,26 +21,42 @@ def _emit(payload) -> None:
 
 
 @app.command()
-def login() -> None:
-    """Open a window and sign in once. Closes itself when the sign-in lands."""
-    typer.echo("Opening a window on the dedicated profile.")
+def login(
+    profile: str = typer.Option(session.DEFAULT_PROFILE, help="which stored profile to sign in"),
+    timeout: float = typer.Option(600.0, help="seconds to wait for the sign-in to land"),
+) -> None:
+    """Open a window and sign in once. Closes itself when the sign-in lands.
+
+    Blocking, and that is correct here: a human is already at this terminal. The MCP surface
+    spawns *this command* as a detached child instead, via `google_initiate_login`, so there
+    is one login implementation behind both. `--profile` and `--timeout` exist for that
+    caller as much as for a person.
+
+    Exit code carries the taxonomy like every other command: 3 (auth_expired) when the window
+    closed without a session.
+    """
+    typer.echo(f"Opening a window on the dedicated profile {profile!r}.")
     typer.echo("Sign in to the account you want searches personalized to.")
     typer.echo("The window closes on its own once you are signed in; closing it by hand also works.")
     typer.echo("")
     typer.echo("  This profile is separate from your Chrome, so Chrome's /u/0 default")
     typer.echo("  does not apply -- whatever you sign in as here is what gets used.")
-    result = session.login()
+    result = session.login(profile, timeout=timeout)
     if result["signed_in"]:
         typer.echo(f"\nSigned in as {result['account']}.")
     else:
         typer.echo("\nNo session detected. Re-run and complete the sign-in, or check `cli status`.")
     _emit(result)
+    if not result["signed_in"]:
+        raise typer.Exit(3)
 
 
 @app.command()
-def status() -> None:
-    """Is the profile signed in, and as whom."""
-    _emit(session.status())
+def status(
+    profile: str = typer.Option(session.DEFAULT_PROFILE, help="which stored profile to report on"),
+) -> None:
+    """Is the profile signed in, and as whom. Also the poll surface for a started login."""
+    _emit(session.status(profile))
 
 
 @app.command()

@@ -33,11 +33,19 @@ Two consequences the rest of the code depends on:
   runs one. Every Playwright touch is funnelled through a single dedicated worker thread
   that owns the browser for the process lifetime. Nothing outside that thread may hold a
   Playwright object.
+
+Login has two surfaces over one implementation. `login()` is the interactive-blocking one,
+correct at a terminal a human is sitting at. `start_login()` spawns that same command as a
+detached child and returns in well under a second, which is what the `google_initiate_login`
+MCP tool calls -- a tool that blocks for as long as a person takes to type a password and a
+2FA code is, from the agent's side, indistinguishable from a hung server. The outcome is read
+back from `status()`. See the login-initiation block near the bottom of this file.
 """
 from __future__ import annotations
 
 import os
 import random
+import subprocess
 import sys
 import threading
 import time
@@ -242,8 +250,18 @@ def _ensure_browser(profile: str = DEFAULT_PROFILE):
     context's close event set `_ctx_dead`, so tear the corpse down and relaunch. The
     `_warmed` reset inside `_teardown` matters -- a fresh context refuses direct /search
     navigation until warmed again, so the flag must not survive the relaunch.
+
+    Also the daemon-wide pause point. `start_login` releases this process's hold on the
+    profile so the login window can take Chromium's exclusive lock, which means any search
+    arriving during a login would otherwise race the child for that lock and surface as
+    `_locked`'s "another agent has it open" -- true in the letter and useless in substance,
+    because the holder is a login window this very server opened. Refusing up front labels
+    it correctly. One process serves every session on this box (the shared :8766 daemon), so
+    checking one in-process registry really does pause every seat, for free.
     """
     global _pw_cm, _pw, _ctx, _page, _ctx_dead
+    if login_in_flight(profile):
+        raise _paused_for_login(profile)
     if _ctx_dead:
         _teardown()
     if _ctx is not None:
@@ -365,6 +383,21 @@ def _locked(profile: str) -> RateLimited:
         f"exclusive lock on a user-data-dir). Another agent -- Claude Code, pi, a dispatch "
         f"worker -- has it open. Retry shortly, or give this agent its own profile by "
         f"setting GOOGLE_MCP_PROFILE to a different name and running `gsearch login` for it."
+    )
+
+
+def _paused_for_login(profile: str) -> RateLimited:
+    """A login window this server opened is holding the profile. Same kind as `_locked`.
+
+    `rate_limited` for the same reason and with the same contract: back off, then retry, the
+    holder is temporary. It is deliberately not `auth_expired` -- nothing here says the
+    session is bad, only that it cannot be read for the next minute or two -- and it names
+    the poll surface so the wait is informed rather than blind.
+    """
+    return RateLimited(
+        f"a login window is open on the user's screen; retry when google_session_status "
+        f"reports signed_in (profile {profile!r}). Searches on this box are paused until "
+        f"the user finishes or abandons that window."
     )
 
 
@@ -529,9 +562,41 @@ def read_account(page) -> str | None:
 
 
 def status(profile: str = DEFAULT_PROFILE) -> dict:
+    """Whether the profile holds a live session, and the poll surface for `start_login`.
+
+    The registry is checked before the browser is touched, and that order is load-bearing:
+    a login child holds Chromium's exclusive lock on the profile dir, so probing while one
+    is up would be refused by the pause guard anyway -- and reporting `signed_in: false`
+    for a session that is mid-sign-in is the same class of lie the dead-browser bug was.
+    While a window is open this answers `login: "login_in_progress"` and touches nothing.
+
+    Once the child has exited, this call is also where it gets *classified*: the probe below
+    is the observable signal, never the child's exit code or its stdout. A child killed from
+    outside exits non-zero having possibly succeeded, and a clean exit can still leave no
+    session.
+    """
+    running = login_in_flight_seconds(profile)
+    if running is not None:
+        return {
+            "profile": profile,
+            "profile_dir": str(profile_dir(profile)),
+            "signed_in": False,
+            "account": None,
+            "headless": HEADLESS,
+            "warmed": False,
+            "login": "login_in_progress",
+            "started_s_ago": int(running),
+            "note": (
+                "a login window is open on the user's screen; waiting for the user to "
+                "finish signing in. Poll this again in a few seconds. Searches on this box "
+                "return rate_limited until it closes."
+            ),
+        }
+
     def _work():
         page = _ensure_browser(profile)
         signed_in = has_auth_session(page.context)
+        _classify_finished_login(profile, signed_in)
         # Only worth a page load when there is a session to name. Skipping it when signed
         # out also keeps `status()` from navigating on every call.
         account = read_account(page) if signed_in else None
@@ -542,6 +607,7 @@ def status(profile: str = DEFAULT_PROFILE) -> dict:
             "account": account,
             "headless": HEADLESS,
             "warmed": _warmed,
+            "login": "signed_in" if signed_in else "signed_out",
         }
 
     with _lock:
@@ -557,8 +623,10 @@ def require_account(profile: str = DEFAULT_PROFILE) -> str | None:
     st = status(profile)
     if not st["signed_in"]:
         raise AuthExpired(
-            "No live Google session in the dedicated profile. "
-            "Run `gsearch login` in a terminal and sign in once."
+            "No live Google session in the dedicated profile. Call the "
+            "`google_initiate_login` tool (it opens a sign-in window on the user's screen "
+            "and returns immediately, then poll `google_session_status`), or run "
+            "`gsearch login` in a terminal."
         )
     return st["account"]
 
@@ -589,9 +657,17 @@ def shutdown() -> None:
 def login(profile: str = DEFAULT_PROFILE, timeout: float = 600.0) -> dict:
     """Interactive by design. Opens a real window; closes itself once you are signed in.
 
-    Never call this from the MCP server. A tool that blocks for minutes, and whose failure
-    looks like a timeout instead of a missing login, gets debugged in the wrong place --
-    the doctolib lesson, and it applies unchanged here.
+    **Never call this in-process from the MCP server.** It blocks for as long as a human
+    takes to type a password and a 2FA code, and a tool call that hangs for minutes and then
+    fails as a timeout gets debugged as a transport problem, in the wrong file, by someone
+    with no reason to suspect a person was the latency. That was the original ban and it
+    stands for the direct call.
+
+    What the ban was never about is the *login itself* being unreachable from an agent. The
+    sanctioned shape is `start_login()` below: this same command spawned as a detached child,
+    returning a state immediately, with the outcome polled off `status()`. One login
+    implementation, two surfaces -- blocking here where a human is already at a terminal,
+    non-blocking there where an agent is not allowed to wait.
 
     The first version waited on `page.wait_for_event("close")` and nothing else, so a
     successful sign-in produced no acknowledgement at all: the window just sat there until
@@ -666,3 +742,250 @@ def login(profile: str = DEFAULT_PROFILE, timeout: float = 600.0) -> dict:
         "signed_in": signed_in,
         "account": account,
     }
+
+
+# ---------------------------------------------------------- non-blocking login initiation
+#
+# The same `gsearch login` child, spawned the other way: nobody waits for it. This is what
+# `google_initiate_login` calls, and it returns a state in well under a second, always.
+#
+# Three things make this different from doctolib's version of the same shape, all of them
+# consequences of the browser being the transport here rather than a cookie source:
+#
+# 1. This process is *holding* the profile. Chromium's lock on a user-data-dir is exclusive
+#    and the server keeps its persistent context open for the process lifetime, so the login
+#    window cannot open until we let go: `start_login` calls `shutdown()` first. Re-acquiring
+#    afterwards is left to `_ensure_browser`'s ordinary laziness -- the next search relaunches
+#    it. Nothing needs to watch for the child's exit to make that happen.
+# 2. Because we let go, every seat on this box is paused for the duration -- one shared
+#    daemon serves them all. `_ensure_browser` refuses with `rate_limited` while a login is
+#    in flight, which is the honest label; without it the same calls would still fail, just
+#    as a profile-lock collision blaming "another agent".
+# 3. The pre-spawn session probe reads the context this process already has, and does not
+#    launch one to find out. Launching would cost seconds and would take the very lock we are
+#    about to release, which turns a sub-second tool into the blocking call it exists to
+#    replace. On a cold server the probe is skipped and a window opens -- and if the session
+#    was live all along, `login()` sees `SID` on its first poll and closes the window itself
+#    within a couple of seconds.
+
+_LOGIN_TIMEOUT = float(os.environ.get("GOOGLE_MCP_LOGIN_TIMEOUT", "600"))
+
+# Long enough that an abandoned window is not immediately reopened by a retrying agent, short
+# enough that a user who walked away and came back is not told to wait. Doctolib's number.
+_LOGIN_COOLDOWN = 90.0
+
+# Single-flight. Acquired NON-BLOCKING, always: waiting on it would wait out an entire login,
+# which is exactly the multi-minute block this whole path exists to avoid. Held only across
+# the teardown-and-spawn, never across anything that waits on the browser thread.
+_login_lock = threading.Lock()
+
+# The registry, and the only state the pause guard reads. Its own lock, held for dict/set
+# operations and nothing else: `_ensure_browser` runs on the browser thread and consults it,
+# while `start_login` holds `_login_lock` across a `shutdown()` that queues work onto that
+# same thread. Sharing one lock between the two would deadlock the pair.
+_login_registry_lock = threading.Lock()
+_login_procs: dict[str, tuple[subprocess.Popen, float]] = {}
+_login_reserved: set[str] = set()      # spawn intended, browser being released
+_login_unclassified: set[str] = set()  # child exited, outcome not yet read off a probe
+_login_last_failure: dict[str, float] = {}
+
+
+def _login_child(profile: str, timeout_s: float) -> tuple[list[str], dict, int]:
+    """argv/env/creationflags for one `gsearch login` child.
+
+    The CLI command, not `login()` imported and called: a child process is the only way to
+    run the sync Playwright driver while an asyncio server owns this one, and it is also what
+    makes the window outlive the tool call.
+
+    CREATE_NO_WINDOW suppresses the *helper's* console. The browser is a separate process and
+    stays visible -- and in the viewport, since `login()` strips the offscreen argument. An
+    offscreen login window is a tool that reports login_started and then times out with no
+    visible cause.
+    """
+    src_root = str(Path(__file__).resolve().parent.parent)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = src_root + os.pathsep + env.get("PYTHONPATH", "")
+    # This child *is* the login; it must never start one of its own.
+    env["GOOGLE_MCP_LOGIN_CHILD"] = "1"
+    argv = [sys.executable, "-m", "google_search_mcp.cli", "login",
+            "--profile", profile, "--timeout", str(int(timeout_s))]
+    return argv, env, getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def login_in_flight_seconds(profile: str = DEFAULT_PROFILE) -> float | None:
+    """Seconds since a login for `profile` began, or None if none is running.
+
+    Reaps an exited child on the way past. Deliberately does NOT classify it here: the
+    verdict comes from re-probing the auth cookies on the next context this process acquires
+    (`status` does it), never from the child's exit code and never from its stdout.
+    """
+    with _login_registry_lock:
+        if profile in _login_reserved:
+            return 0.0
+        ent = _login_procs.get(profile)
+        if ent is None:
+            return None
+        proc, started = ent
+        if proc.poll() is None:
+            return max(0.0, time.monotonic() - started)
+        _login_procs.pop(profile, None)
+        _login_unclassified.add(profile)
+        return None
+
+
+def login_in_flight(profile: str = DEFAULT_PROFILE) -> bool:
+    """Is a login window open for this profile right now. The pause guard's whole question."""
+    return login_in_flight_seconds(profile) is not None
+
+
+def _classify_finished_login(profile: str, signed_in: bool) -> None:
+    """Turn the first post-login auth probe into the success/failure verdict.
+
+    Called with the result of a real `has_auth_session` read, which is the observable signal
+    the capture records. A no-op unless a child recently exited unclassified, so ordinary
+    status calls do not keep rewriting the cooldown.
+    """
+    with _login_registry_lock:
+        if profile not in _login_unclassified:
+            return
+        _login_unclassified.discard(profile)
+        if signed_in:
+            _login_last_failure.pop(profile, None)
+        else:
+            _login_last_failure[profile] = time.monotonic()
+
+
+def start_login(profile: str = DEFAULT_PROFILE, timeout_s: float = _LOGIN_TIMEOUT) -> dict:
+    """Start an interactive login and return immediately. Never blocks, never raises.
+
+    Returns one of four success-shaped dicts -- already_signed_in / login_started /
+    login_in_progress / cooldown -- or, only when the spawn itself fails, a `schema_drift`
+    envelope with `detail.cause: "environment"`. A login the user abandons is a *state*, not
+    an exception: it surfaces as the cooldown that follows, read through `status()`.
+
+    State machine: idle -> login_in_progress -> signed_in | failed (-> cooldown -> idle).
+
+    Sub-second in the ordinary case. The one thing it does wait on is a search already
+    running on the browser thread, because the profile lock cannot be released mid-page-load;
+    that is bounded by one call, and no *new* call can extend it -- the pause guard is armed
+    before the teardown starts.
+    """
+    if os.environ.get("GOOGLE_MCP_LOGIN_CHILD") == "1":
+        return {
+            "error": {
+                "kind": "schema_drift",
+                "message": "refusing to start a login from inside a login helper process",
+                "detail": {"cause": "environment"},
+            }
+        }
+
+    # Non-blocking, deliberately: a held lock means another caller is already tearing the
+    # browser down to spawn a window. Waiting for it would block for the length of a login.
+    if not _login_lock.acquire(blocking=False):
+        running = login_in_flight_seconds(profile) or 0.0
+        return {
+            "status": "login_in_progress",
+            "profile": profile,
+            "started_s_ago": int(running),
+            "note": "a login is already being started; no second window was opened",
+            "poll": "google_session_status",
+        }
+    try:
+        return _start_login_locked(profile, timeout_s)
+    finally:
+        _login_lock.release()
+
+
+def _start_login_locked(profile: str, timeout_s: float) -> dict:
+    # Registry before probe: while a child is up it owns the profile lock, so a probe would
+    # be refused by the pause guard, and a second window is not something the OS would grant
+    # us anyway.
+    running = login_in_flight_seconds(profile)
+    if running is not None:
+        return {
+            "status": "login_in_progress",
+            "profile": profile,
+            "started_s_ago": int(running),
+            "poll": "google_session_status",
+        }
+
+    # The cheap probe, before any spawn, so calling this on a live session opens nothing.
+    # Reads the context this process already holds; see note 3 in the block comment above for
+    # why it does not launch one when there is none.
+    if _live_session_now(profile):
+        return {
+            "status": "already_signed_in",
+            "profile": profile,
+            "note": ("a live session already exists; nothing was opened. "
+                     "`google_session_status` names the account."),
+        }
+
+    now = time.monotonic()
+    last = _login_last_failure.get(profile)
+    if last is not None and now - last < _LOGIN_COOLDOWN:
+        return {
+            "status": "cooldown",
+            "profile": profile,
+            "retry_after_s": int(_LOGIN_COOLDOWN - (now - last)) + 1,
+            "note": "a recent login attempt did not produce a session; not reopening a window yet",
+        }
+
+    # Reserve before releasing the browser, not after spawning: between the two there is a
+    # window in which this process holds no context and no child exists yet, and a search
+    # landing there would relaunch the browser and take back the lock the child needs.
+    with _login_registry_lock:
+        _login_reserved.add(profile)
+    try:
+        shutdown()
+    except Exception:
+        pass  # a browser that will not close cleanly must not block the login
+
+    argv, env, flags = _login_child(profile, timeout_s)
+    try:
+        proc = subprocess.Popen(argv, env=env, creationflags=flags,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        with _login_registry_lock:
+            _login_reserved.discard(profile)
+        # The one case that is genuinely an error rather than a state: the child could not be
+        # started at all, which is the environment's problem, not the session's.
+        return {
+            "error": {
+                "kind": "schema_drift",
+                "message": f"could not spawn the login helper: {str(e)[:200]}",
+                "detail": {"cause": "environment", "argv": argv[:4]},
+            }
+        }
+
+    with _login_registry_lock:
+        _login_procs[profile] = (proc, time.monotonic())
+        _login_reserved.discard(profile)
+        _login_unclassified.discard(profile)
+    return {
+        "status": "login_started",
+        "note": "a browser window is now open on the user's screen",
+        "poll": "google_session_status",
+        "timeout_s": int(timeout_s),
+        "profile": profile,
+        "pid": proc.pid,
+    }
+
+
+def _live_session_now(profile: str) -> bool:
+    """Auth cookies in the context this process already has open. Launches nothing.
+
+    False when there is no context, which is "unknown", not "signed out" -- and treating the
+    unknown as signed-out is the safe direction here: the cost is a window that closes itself
+    a second later, against a login that silently never opens.
+    """
+    if _ctx is None or _ctx_dead:
+        return False
+
+    def _work():
+        return has_auth_session(_ctx)
+
+    try:
+        with _lock:
+            return bool(in_browser_thread(_work))
+    except Exception:
+        return False

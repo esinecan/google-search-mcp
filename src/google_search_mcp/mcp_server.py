@@ -55,8 +55,51 @@ def google_session_status() -> dict:
     returns the neutral (unpersonalized) view. The account is read off the page rather
     than assumed, because "whoever was signed in" is not a safe default on a box with
     more than one Google account.
+
+    Reports only -- it never opens a login window, so it is the safe way to check, and it is
+    **the poll surface for a login started by `google_initiate_login`**. While that window is
+    open this returns `login: "login_in_progress"` with `started_s_ago` and touches nothing;
+    once the window is finished or abandoned it settles on `login: "signed_in"` or
+    `"signed_out"`, read from a real cookie probe rather than from the helper's exit code.
+    Poll it every few seconds, not in a tight loop.
     """
     return session.status()
+
+
+@mcp.tool()
+def google_initiate_login(profile: Optional[str] = None) -> dict:
+    """⚠️ OPENS A BROWSER WINDOW ON THE USER'S SCREEN — starts a Google sign-in. ⚠️
+
+    Non-blocking: it returns immediately. The login itself continues in that window while the
+    user types their password and any 2FA, which takes as long as it takes. Poll
+    `google_session_status` for the outcome; do not re-call whatever failed.
+
+    Do NOT call this to check whether a session exists — that is `google_session_status`,
+    which opens nothing. This is for after a tool has already come back with
+    `kind: "auth_expired"` (whose `detail.login_tool` names this tool) and the user wants to
+    sign in.
+
+    Attended contexts only. A scheduled run, a sentinel or any headless worker has nobody in
+    front of the screen to type a password: the window sits there and times out.
+
+    Single-flighted, so repeated calls are safe but pointless — the second returns
+    `login_in_progress`, which is information, not progress. It never opens a second window.
+
+    **It pauses Google search for this whole box while the window is open.** One shared server
+    backs every agent session here, and it has to release the browser profile so the login
+    window can take it (Chromium locks a profile directory exclusively). Until the login
+    finishes or is abandoned, `google_search`, `google_fetch`, `google_ai_mode` and
+    `google_multi_search` return `kind: "rate_limited"` — in every session, not just this one.
+    So call it when the user is actually there to sign in, not speculatively.
+
+    `profile` selects a stored profile; omit it to use the one this server was configured
+    with. Returns one of: `{"status": "already_signed_in"}` (a session probe runs first, so
+    calling this on a live session opens nothing), `{"status": "login_started", ...}`,
+    `{"status": "login_in_progress", "started_s_ago": N}`, or `{"status": "cooldown",
+    "retry_after_s": N}` after a recent attempt that produced no session. There is no confirm
+    argument: this writes nothing to Google, and the user does the authenticating.
+    """
+    return session.start_login(profile or session.DEFAULT_PROFILE)
 
 
 @mcp.tool()
@@ -122,9 +165,11 @@ def google_search(
     `pages` is 10 results each, max 5, and each page is a separate round trip -- ask for
     depth only when you actually need it. Ignored for `images`.
 
-    On failure the result carries a `kind` field: auth_expired (sign in), schema_drift
-    (the extractor is stale, do not retry), rate_limited (back off). An empty result set
-    is NOT an error -- it returns count=0 with no `kind`, and means Google matched nothing.
+    On failure the result carries a `kind` field: auth_expired (sign in -- the envelope's
+    `detail.login_tool` names the tool that does it), schema_drift (the extractor is stale,
+    do not retry), rate_limited (back off; one cause is a login window open on this box, see
+    `google_initiate_login`). An empty result set is NOT an error -- it returns count=0 with
+    no `kind`, and means Google matched nothing.
     """
     try:
         return client.search(

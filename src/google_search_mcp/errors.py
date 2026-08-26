@@ -17,12 +17,22 @@ from __future__ import annotations
 
 
 class GoogleError(Exception):
-    """Base. `kind` is what the agent branches on; the message is for the human."""
+    """Base. `kind` is what the agent branches on; the message is for the human.
+
+    `detail` is the optional second branchable layer: a small flat dict of fields, never
+    prose. It exists so a remedy an agent can *act* on -- the name of a tool to call --
+    arrives as a field rather than as something to regex out of `error`. Omitted from the
+    result entirely when there is nothing to say, so the common shape stays unchanged.
+    """
 
     kind: str = "unknown"
+    detail: dict | None = None
 
     def as_result(self) -> dict:
-        return {"kind": self.kind, "error": str(self), "results": [], "count": 0}
+        out = {"kind": self.kind, "error": str(self), "results": [], "count": 0}
+        if self.detail:
+            out["detail"] = self.detail
+        return out
 
 
 class AuthExpired(GoogleError):
@@ -30,9 +40,15 @@ class AuthExpired(GoogleError):
 
     Never retried automatically: re-login is interactive by nature, and an agent that
     retries into a login wall burns its budget producing the same failure.
+
+    Carries its own remedy in `detail.login_tool`: staying strict about auth_expired --
+    never falling back, never auto-driving a browser -- only stays helpful if the envelope
+    names the next move. The agent's licensed sequence is call that tool once, poll
+    `google_session_status`, then retry the original call. Not a tight loop on the failure.
     """
 
     kind = "auth_expired"
+    detail = {"login_tool": "google_initiate_login"}
 
 
 class SchemaDrift(GoogleError):
