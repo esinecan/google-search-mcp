@@ -250,10 +250,11 @@ EXTRACT_JS = r"""
     if (!a || !a.href) return;
 
     let u;
-    try { u = new URL(a.href); } catch (e) { return; }
+    try { u = new URL((cfg.resolvedUrls || {})[a.href] || a.href); } catch (e) { return; }
     if (!/^https?:$/.test(u.protocol)) return;
+    const wrapped = isGoogle(u.hostname) && u.pathname === '/goto' && u.searchParams.has('url');
     // /url, /aclk and internal chrome -- except on verticals whose results ARE google-hosted.
-    if (isGoogle(u.hostname) && !cfg.googleHosts) return;
+    if (isGoogle(u.hostname) && !cfg.googleHosts && !(cfg.collectRedirects && wrapped)) return;
 
     const block = resultBlock(a, BARE[cfg.anchor] || BARE.h3);
     const blockText = (block.innerText || '');
@@ -263,7 +264,7 @@ EXTRACT_JS = r"""
     // Google Books puts the identity of a result in the query string -- every link shares
     // the path /books and differs only in ?id=. Keying on origin+pathname collapsed a
     // whole page of books into two results. So google-hosted verticals key on the query too.
-    const key = u.origin + u.pathname + (cfg.googleHosts ? u.search : '');
+    const key = u.origin + u.pathname + (cfg.googleHosts || wrapped ? u.search : '');
     if (seen.has(key)) return;
     seen.add(key);
 
@@ -443,6 +444,38 @@ def parse_result_stats(text: str | None) -> dict:
     return {"total": total, "seconds": seconds, "raw": text}
 
 
+def _extract_results(page, spec: dict) -> dict:
+    """Resolve Google's opaque organic /goto links without visiting result sites.
+
+    Observed 2026-09-06: headings survived, but all hrefs became Google redirects.
+    Use the existing extractor's ad filters to select candidates, then extract again
+    with real destinations so host, snippet filtering and deduplication stay correct.
+    """
+    cfg = {"anchor": spec["anchor"], "googleHosts": bool(spec.get("google_hosts"))}
+    candidates = page.evaluate(EXTRACT_JS, {**cfg, "collectRedirects": True})
+    resolved = {}
+    for row in candidates["organic"]:
+        parsed = urlparse(row["url"])
+        if not (re.fullmatch(r"(?:[\w-]+\.)*google\.[a-z.]+", parsed.hostname or "")
+                and parsed.path == "/goto"):
+            continue
+        try:
+            response = page.request.get(row["url"], max_redirects=0, timeout=10000)
+            try:
+                destination = response.headers.get("location", "")
+                target = urlparse(destination)
+                if response.status not in (301, 302, 303, 307, 308) or target.scheme not in ("http", "https") or not target.hostname:
+                    raise ValueError("missing HTTP redirect destination")
+                resolved[row["url"]] = destination
+            finally:
+                response.dispose()
+        except Exception as exc:
+            raise SchemaDrift("Could not resolve Google's organic /goto redirect.") from exc
+    if resolved:
+        return page.evaluate(EXTRACT_JS, {**cfg, "resolvedUrls": resolved})
+    return candidates
+
+
 def _fetch_page(url: str, spec: dict) -> dict:
     """One SERP. MUST run on the browser thread."""
     page = _session.get_page()
@@ -456,10 +489,7 @@ def _fetch_page(url: str, spec: dict) -> dict:
         )
 
     time.sleep(random.uniform(0.9, 1.6))
-    data = page.evaluate(
-        EXTRACT_JS,
-        {"anchor": spec["anchor"], "googleHosts": bool(spec.get("google_hosts"))},
-    )
+    data = _extract_results(page, spec)
 
     if not data["organic"] and not data["no_results_banner"]:
         raise SchemaDrift(
