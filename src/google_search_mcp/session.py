@@ -32,7 +32,11 @@ Two consequences the rest of the code depends on:
 - **Threading.** `sync_playwright()` raises inside an asyncio loop, and the MCP server
   runs one. Every Playwright touch is funnelled through a single dedicated worker thread
   that owns the browser for the process lifetime. Nothing outside that thread may hold a
-  Playwright object.
+  Playwright object. A live Playwright counts as a running loop on its own thread -- the
+  sync API drives one from a dispatcher greenlet that is suspended, not finished -- so
+  entering a second `sync_playwright()` on the browser thread raises the same asyncio
+  error. There must never be more than one, and a failed launch must drop the one it
+  started: see `_drop_playwright`.
 
 Login has two surfaces over one implementation. `login()` is the interactive-blocking one,
 correct at a terminal a human is sitting at. `start_login()` spawns that same command as a
@@ -243,6 +247,36 @@ def _playwright_cm():
     return sync_playwright()
 
 
+def _drop_playwright() -> None:
+    """Close the Playwright handle and forget it. MUST run on the browser thread.
+
+    A launch failure -- a locked profile dir, no browser binary, anything Chromium refuses
+    -- happens *after* `sync_playwright()` has already started. Leaving that started handle
+    in `_pw_cm` is not a leak that merely wastes a driver process: it makes the next call
+    unrecoverable, and the error it produces names the wrong cause.
+
+    The sync API runs its event loop inside a dispatcher greenlet on this thread. Between
+    calls that loop is suspended but still `is_running()`, so a second `sync_playwright()`
+    on the same thread finds a running loop and raises "It looks like you are using
+    Playwright Sync API inside the asyncio loop. Please use the Async API instead." From
+    the first failed launch to process exit, every tool then reports an asyncio problem
+    that does not exist and hides the real one (usually: another process holds the profile
+    lock, which is transient and self-describing).
+
+    Measured 2026-09-07 on the shared :8766 daemon: a second server process held the
+    'agent' profile, the daemon's first launch raised `_locked` correctly, and every call
+    after it -- `google_session_status`, `google_search`, all of them -- returned the
+    Playwright asyncio message instead.
+    """
+    global _pw_cm, _pw
+    try:
+        if _pw_cm is not None:
+            _pw_cm.__exit__(None, None, None)
+    except Exception:
+        pass
+    _pw_cm = _pw = None
+
+
 def _ensure_browser(profile: str = DEFAULT_PROFILE):
     """Lazily start the browser. MUST be called on the browser thread.
 
@@ -269,22 +303,28 @@ def _ensure_browser(profile: str = DEFAULT_PROFILE):
 
     _pw_cm, _pw = _new_playwright()
     try:
-        _ctx = _pw.chromium.launch_persistent_context(**_launch_kwargs(profile, HEADLESS))
-    except Exception as first:
-        if _is_profile_lock(first):
-            raise _locked(profile) from first
-        # Chrome absent (pi, a server, a fresh box). Bundled Chromium passes on its own
-        # once the automation flag is stripped -- measured, not assumed.
-        kw = _launch_kwargs(profile, HEADLESS)
-        kw.pop("channel", None)
         try:
-            _ctx = _pw.chromium.launch_persistent_context(**kw)
-        except Exception as second:
-            if _is_profile_lock(second):
-                raise _locked(profile) from second
-            if _is_missing_browser(second):
-                raise _missing_browser() from second
-            raise
+            _ctx = _pw.chromium.launch_persistent_context(**_launch_kwargs(profile, HEADLESS))
+        except Exception as first:
+            if _is_profile_lock(first):
+                raise _locked(profile) from first
+            # Chrome absent (pi, a server, a fresh box). Bundled Chromium passes on its own
+            # once the automation flag is stripped -- measured, not assumed.
+            kw = _launch_kwargs(profile, HEADLESS)
+            kw.pop("channel", None)
+            try:
+                _ctx = _pw.chromium.launch_persistent_context(**kw)
+            except Exception as second:
+                if _is_profile_lock(second):
+                    raise _locked(profile) from second
+                if _is_missing_browser(second):
+                    raise _missing_browser() from second
+                raise
+    except BaseException:
+        # A launch that failed leaves a live Playwright handle behind, and that handle
+        # poisons every later call in the process. See `_drop_playwright`.
+        _drop_playwright()
+        raise
 
     _page = _ctx.pages[0] if _ctx.pages else _ctx.new_page()
     # Fires when the browser process goes away, which is the only reliable early
@@ -638,13 +678,14 @@ def _teardown() -> None:
     `in_browser_thread`, where the caller may already hold `_lock` (see `status`) and a
     lock-taking teardown would deadlock the single browser thread against its caller.
     """
-    global _pw_cm, _pw, _ctx, _page, _warmed, _ctx_dead
-    for closer in (lambda: _ctx and _ctx.close(), lambda: _pw_cm and _pw_cm.__exit__(None, None, None)):
-        try:
-            closer()
-        except Exception:
-            pass
-    _pw_cm = _pw = _ctx = _page = None
+    global _ctx, _page, _warmed, _ctx_dead
+    try:
+        if _ctx is not None:
+            _ctx.close()
+    except Exception:
+        pass
+    _drop_playwright()
+    _ctx = _page = None
     _warmed = False
     _ctx_dead = False
 
