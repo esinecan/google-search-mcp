@@ -160,7 +160,7 @@ def google_search(
     same logged-in browser, so it reads JS-rendered pages and soft paywalls that a plain
     HTTP fetch cannot. Costs a real page load each -- budget a few seconds per result, and
     raise `content_chars` (default 2000) only when you actually need the whole article.
-    A page that could not be read sets `content: null` and `content_error`.
+    A page that could not be read sets `content: null` and `content_error`. A `thin`, `walled` or `lossy` page also sets `content_reason`.
 
     `pages` is 10 results each, max 5, and each page is a separate round trip -- ask for
     depth only when you actually need it. Ignored for `images`.
@@ -194,14 +194,18 @@ def google_fetch(urls: list[str], max_chars: int = 2000) -> dict:
 
     Boilerplate (nav, footers, cookie banners, related-story rails) is stripped and only
     the article body comes back, so the payload is a fraction of the raw HTML. Output is
-    markdown, which keeps headings, lists and code fences intact.
+    markdown with headings, lists and fenced code blocks.
 
     Capped at 5 URLs per call and read sequentially with per-host throttling -- this is a
     real browser making real requests. `max_chars` truncates each page on a paragraph
     boundary and sets `truncated` with the full length in `chars_total`.
 
-    A page that cannot be read comes back with `ok: false` and a reason rather than
-    sinking the call.
+    A page that cannot be read comes back with `ok: false` and an `error` rather than
+    sinking the call. Three checks also return `ok: false`, with a `reason`, and keep the
+    `markdown` so you can judge it: `walled` when the HTTP `status` is 401, 403 or 429;
+    `thin` when the markdown is under 500 characters, which is what a page that renders
+    only with JavaScript or a bot wall gives; `lossy` when a `<pre>` block of the page is
+    missing from the markdown.
     """
     try:
         return client.fetch(urls, max_chars=max_chars)

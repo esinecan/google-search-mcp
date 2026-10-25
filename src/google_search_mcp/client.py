@@ -66,6 +66,8 @@ CONTENT_DEFAULT_CHARS = 2000
 CONTENT_MAX_CHARS = 20000
 CONTENT_DEFAULT_TOP_N = 3
 CONTENT_MAX_TOP_N = 5
+WALL_STATUSES = (401, 403, 429)
+THIN_CHARS = 500
 
 FRESHNESS = {
     "hour": "qdr:h",
@@ -599,6 +601,8 @@ def search(
                 item["content"] = got.get("markdown") if got.get("ok") else None
                 if not got.get("ok"):
                     item["content_error"] = got.get("error")
+                    if got.get("reason"):
+                        item["content_reason"] = got["reason"]
                 elif got.get("truncated"):
                     item["content_truncated"] = True
                     item["content_chars_total"] = got.get("chars_total")
@@ -667,6 +671,20 @@ def _truncate(md: str, max_chars: int) -> tuple[str, bool]:
     return cut.rstrip(), True
 
 
+def _pre_first_lines(html: str) -> list[str]:
+    try:
+        from lxml import html as lh
+        root = lh.fromstring(html)
+    except Exception:
+        return []
+    lines = []
+    for pre in root.xpath("//pre"):
+        rows = [row.strip() for row in pre.text_content().splitlines() if row.strip()]
+        if rows:
+            lines.append(" ".join(rows[0].split()))
+    return lines
+
+
 def _fetch_one(url: str, max_chars: int) -> dict:
     """One page to markdown. MUST run on the browser thread."""
     max_chars = max(200, min(int(max_chars), CONTENT_MAX_CHARS))
@@ -676,29 +694,36 @@ def _fetch_one(url: str, max_chars: int) -> dict:
     page = _session.get_page()
     _throttle.wait(url)  # per-host, so a fresh host is not made to wait for Google's window
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
         time.sleep(random.uniform(0.6, 1.2))  # let deferred content paint
         html = page.content()
     except Exception as exc:
         # One dead link must not sink a search. Same per-item isolation as multi_search.
         return {"url": url, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
+    status = response.status if response is not None else None
     md = _to_markdown(html, url)
-    if not md.strip():
-        return {
-            "url": url,
-            "ok": False,
-            "error": "no article content extracted (login wall, or not an article page)",
-        }
     text, truncated = _truncate(md, max_chars)
-    return {
-        "url": url,
-        "ok": True,
-        "markdown": text,
-        "chars": len(text),
-        "chars_total": len(md),
-        "truncated": truncated,
-    }
+    body = {"url": url, "status": status, "markdown": text, "chars": len(text),
+            "chars_total": len(md), "truncated": truncated}
+    if status in WALL_STATUSES:
+        return {**body, "ok": False, "reason": "walled",
+                "error": f"HTTP {status}: the site refused the page (bot wall, login or rate limit)"}
+    if not md.strip():
+        return {"url": url, "ok": False, "status": status,
+                "error": "no article content extracted (login wall, or not an article page)"}
+    size = len(md.strip())
+    if size < THIN_CHARS:
+        return {**body, "ok": False, "reason": "thin",
+                "error": f"only {size} characters of markdown: a JavaScript shell, a wall or a stub"}
+    firsts = _pre_first_lines(html)
+    flat = " ".join(md.split())
+    missing = [line for line in firsts if line not in flat]
+    if missing:
+        return {**body, "ok": False, "reason": "lossy", "pre_total": len(firsts),
+                "pre_missing": len(missing),
+                "error": f"{len(missing)} of {len(firsts)} <pre> blocks are missing from the markdown, first {missing[0][:80]!r}"}
+    return {**body, "ok": True}
 
 
 def fetch(urls: list[str], max_chars: int = CONTENT_DEFAULT_CHARS) -> dict:
