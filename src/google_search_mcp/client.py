@@ -640,14 +640,72 @@ def search(
 # Markdown rather than text because structure is most of the meaning in a technical page --
 # headings, code fences and lists survive, and it costs fewer tokens than the HTML did.
 
+_CALLOUT_CLASS = re.compile(r"callout|admonition", re.I)
+_BLOCK_TEXT = ".//p|.//h1|.//h2|.//h3|.//h4|.//h5|.//h6|.//li|.//table"
+_CHROME_SLACK = 80
+_GLUED_FENCE = re.compile(r"([^\n])```\n")
+
+
+def _normalize_html(html: str) -> str:
+    from lxml import html as lh
+
+    doc = lh.fromstring(html)
+    for pre in doc.xpath("//pre"):
+        text = pre.text_content()
+        size = len(text.strip())
+        if not size:
+            continue
+        outer = pre
+        for anc in pre.iterancestors():
+            if anc.tag in ("body", "html", "main", "article"):
+                break
+            if len(anc.xpath(".//pre")) > 1 or anc.xpath(_BLOCK_TEXT):
+                break
+            if len(anc.text_content().strip()) > size + _CHROME_SLACK:
+                break
+            outer = anc
+        parent = outer.getparent()
+        if parent is None:
+            continue
+        clean = lh.Element("pre")
+        code = lh.Element("code")
+        code.text = text
+        clean.append(code)
+        clean.tail = outer.tail
+        parent.replace(outer, clean)
+
+    boxes = [el for el in doc.xpath("//*[@class]") if _CALLOUT_CLASS.search(el.get("class") or "")]
+    chosen = set(boxes)
+    for box in boxes:
+        if any(anc in chosen for anc in box.iterancestors()):
+            continue
+        if box.xpath(".//pre"):
+            continue
+        text = " ".join(box.text_content().split())
+        parent = box.getparent()
+        if not text or parent is None:
+            continue
+        quote = lh.Element("blockquote")
+        para = lh.Element("p")
+        para.text = text
+        quote.append(para)
+        quote.tail = box.tail
+        parent.replace(box, quote)
+    return lh.tostring(doc, encoding="unicode")
+
+
 def _to_markdown(html: str, url: str) -> str:
     try:
         import trafilatura
     except ImportError:  # soft dependency: searching must not break because extraction is absent
         return ""
-    return (
+    try:
+        source = _normalize_html(html)
+    except Exception:
+        source = html
+    md = (
         trafilatura.extract(
-            html,
+            source,
             url=url,
             output_format="markdown",
             include_links=True,
@@ -658,6 +716,7 @@ def _to_markdown(html: str, url: str) -> str:
         )
         or ""
     )
+    return _GLUED_FENCE.sub(r"\1\n```\n", md)
 
 
 def _truncate(md: str, max_chars: int) -> tuple[str, bool]:
