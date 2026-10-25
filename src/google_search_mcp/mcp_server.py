@@ -37,6 +37,7 @@ import os
 from typing import Optional
 
 from mcp.server import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 
 from . import client, session
 from . import __version__
@@ -266,6 +267,20 @@ def google_multi_search(
     return client.multi_search(list(queries), pages=pages, personalized=personalized)
 
 
+LOOPBACK_BINDS = ("127.0.0.1", "localhost", "::1")
+ALLOWED_HOSTS = ("127.0.0.1", "localhost", "[::1]", "host.docker.internal")
+
+
+def _transport_security(bind_host: str) -> TransportSecuritySettings | None:
+    if bind_host not in LOOPBACK_BINDS:
+        return None
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[f"{h}:*" for h in ALLOWED_HOSTS],
+        allowed_origins=[f"http://{h}:*" for h in ALLOWED_HOSTS],
+    )
+
+
 def main() -> None:
     """Entry point for the `gsearch-mcp` console script.
 
@@ -296,10 +311,12 @@ def main() -> None:
         return
 
     if transport in ("http", "streamable-http"):
+        host = os.environ.get("GOOGLE_MCP_HTTP_HOST", "127.0.0.1")
         mcp.run(
             transport="streamable-http",
-            host=os.environ.get("GOOGLE_MCP_HTTP_HOST", "127.0.0.1"),
+            host=host,
             port=int(os.environ.get("GOOGLE_MCP_HTTP_PORT", "8766")),
+            transport_security=_transport_security(host),
         )
         return
 

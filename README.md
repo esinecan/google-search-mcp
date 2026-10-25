@@ -133,6 +133,8 @@ then register it as a URL server rather than a command, e.g.
 claude mcp add --transport http google-search http://127.0.0.1:8766/mcp
 ```
 
+A loopback bind accepts the `Host` headers `127.0.0.1`, `localhost`, `[::1]` and `host.docker.internal`, on any port. A Docker container therefore reaches the server at `http://host.docker.internal:8766/mcp` with no header override. Any other `Host` gets `421 Invalid Host header`.
+
 Funnelling concurrent callers into one process is safe by construction: every browser call
 goes through `session.in_browser_thread`, a single-worker executor, so requests queue
 instead of colliding. Verified with two simultaneous clients -- both returned results, no
