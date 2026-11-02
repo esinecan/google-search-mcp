@@ -516,8 +516,11 @@ def _dismiss_consent(page) -> None:
         )
 
 
-def _warm(page) -> bool:
-    """Unlock direct /search navigation on this profile. Idempotent, cheap after the first."""
+def _warm(page) -> str | None:
+    """Unlock direct /search navigation on this profile. Idempotent, cheap after the first.
+
+    Returns None on success, or the reason the search box could not be driven.
+    """
     page.goto("https://www.google.com/", wait_until="domcontentloaded", timeout=45000)
     time.sleep(random.uniform(1.5, 2.5))
 
@@ -533,14 +536,14 @@ def _warm(page) -> bool:
             time.sleep(random.uniform(0.08, 0.22))
         time.sleep(random.uniform(0.5, 1.0))
         page.keyboard.press("Enter")
-        page.wait_for_url("**/search**", timeout=25000)
+        page.wait_for_url("**/search**", wait_until="commit", timeout=25000)
         time.sleep(random.uniform(1.5, 2.5))
-    except Exception:
-        return False
+    except Exception as exc:
+        return f"{type(exc).__name__} at {page.url}: {str(exc).splitlines()[0][:200]}"
 
     if _blocked(page):
         raise RateLimited("Google served /sorry/ while warming the profile.")
-    return True
+    return None
 
 
 def get_page(profile: str = DEFAULT_PROFILE):
@@ -548,10 +551,11 @@ def get_page(profile: str = DEFAULT_PROFILE):
     global _warmed
     page = _ensure_browser(profile)
     if not _warmed:
-        if not _warm(page):
+        failure = _warm(page)
+        if failure:
             raise RateLimited(
                 "Could not warm the profile; direct search URLs will be refused. "
-                "Usually a transient block -- wait a few minutes and retry."
+                f"Usually a transient block -- wait a few minutes and retry. ({failure})"
             )
         _warmed = True
     return page

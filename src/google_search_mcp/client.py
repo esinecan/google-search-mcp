@@ -446,36 +446,85 @@ def parse_result_stats(text: str | None) -> dict:
     return {"total": total, "seconds": seconds, "raw": text}
 
 
-def _extract_results(page, spec: dict) -> dict:
-    """Resolve Google's opaque organic /goto links without visiting result sites.
+_GOOGLE_HOST = re.compile(r"(?:[\w-]+\.)*google\.[a-z.]+")
+GOTO_TIMEOUT_S = 20.0
 
-    Observed 2026-09-06: headings survived, but all hrefs became Google redirects.
-    Use the existing extractor's ad filters to select candidates, then extract again
-    with real destinations so host, snippet filtering and deduplication stay correct.
+
+def _is_goto(url: str) -> bool:
+    parsed = urlparse(url)
+    return bool(_GOOGLE_HOST.fullmatch(parsed.hostname or "")) and parsed.path == "/goto"
+
+
+def _leaves_google(url: str) -> bool:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or _is_goto(url):
+        return False
+    host = parsed.hostname or ""
+    if _GOOGLE_HOST.fullmatch(host):
+        return parsed.path.startswith("/sorry") or not host.startswith("www.")
+    return True
+
+
+def _resolve_gotos(context, urls: list[str], timeout_s: float | None = None) -> dict[str, str]:
+    """Open each /goto link in its own tab and record where it leaves Google, without loading that site.
+
+    Google answers /goto with a 200 "Verifying your request" page whose script must run
+    before the browser is sent on, so an HTTP client never sees a redirect. A tab runs the
+    script; its first main-frame navigation off Google is the destination, and that request
+    is aborted.
+    """
+    found: dict[str, str] = {}
+    tabs = []
+
+    def watch(tab, source):
+        def leaving(req):
+            if not (req.is_navigation_request() and req.frame == tab.main_frame and _leaves_google(req.url)):
+                return False
+            found.setdefault(source, req.url)
+            return True
+
+        tab.route("**/*", lambda route: route.abort() if leaving(route.request) else route.fallback())
+        tab.on("request", leaving)
+
+    try:
+        for url in urls:
+            tab = context.new_page()
+            tabs.append(tab)
+            watch(tab, url)
+            tab.goto(url, wait_until="commit", timeout=15000)
+        deadline = time.monotonic() + (GOTO_TIMEOUT_S if timeout_s is None else timeout_s)
+        while len(found) < len(urls) and time.monotonic() < deadline:
+            tabs[0].wait_for_timeout(250)
+    finally:
+        for tab in tabs:
+            try:
+                tab.close()
+            except Exception:
+                pass
+
+    if any(urlparse(u).path.startswith("/sorry") for u in found.values()):
+        raise RateLimited("Google served /sorry/ while resolving organic /goto links.")
+    return found
+
+
+def _extract_results(page, spec: dict) -> dict:
+    """Resolve Google's opaque organic /goto links, then extract with the real destinations.
+
+    The extractor's ad filters select the candidates first, and the second pass keeps host,
+    snippet filtering and deduplication correct. A /goto link that does not resolve drops out.
     """
     cfg = {"anchor": spec["anchor"], "googleHosts": bool(spec.get("google_hosts"))}
     candidates = page.evaluate(EXTRACT_JS, {**cfg, "collectRedirects": True})
-    resolved = {}
-    for row in candidates["organic"]:
-        parsed = urlparse(row["url"])
-        if not (re.fullmatch(r"(?:[\w-]+\.)*google\.[a-z.]+", parsed.hostname or "")
-                and parsed.path == "/goto"):
-            continue
-        try:
-            response = page.request.get(row["url"], max_redirects=0, timeout=10000)
-            try:
-                destination = response.headers.get("location", "")
-                target = urlparse(destination)
-                if response.status not in (301, 302, 303, 307, 308) or target.scheme not in ("http", "https") or not target.hostname:
-                    raise ValueError("missing HTTP redirect destination")
-                resolved[row["url"]] = destination
-            finally:
-                response.dispose()
-        except Exception as exc:
-            raise SchemaDrift("Could not resolve Google's organic /goto redirect.") from exc
-    if resolved:
-        return page.evaluate(EXTRACT_JS, {**cfg, "resolvedUrls": resolved})
-    return candidates
+    wrapped = [row["url"] for row in candidates["organic"] if _is_goto(row["url"])]
+    if not wrapped:
+        return candidates
+    resolved = _resolve_gotos(page.context, wrapped)
+    if not resolved:
+        raise SchemaDrift(
+            f"Could not resolve Google's organic /goto redirect: none of {len(wrapped)} "
+            f"links left Google within {GOTO_TIMEOUT_S:.0f}s."
+        )
+    return page.evaluate(EXTRACT_JS, {**cfg, "resolvedUrls": resolved})
 
 
 def _fetch_page(url: str, spec: dict) -> dict:
