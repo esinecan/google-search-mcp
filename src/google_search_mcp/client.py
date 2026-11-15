@@ -448,6 +448,7 @@ def parse_result_stats(text: str | None) -> dict:
 
 _GOOGLE_HOST = re.compile(r"(?:[\w-]+\.)*google\.[a-z.]+")
 GOTO_TIMEOUT_S = 20.0
+GOTO_TAB_TIMEOUT_MS = 15000
 
 
 def _is_goto(url: str) -> bool:
@@ -491,7 +492,10 @@ def _resolve_gotos(context, urls: list[str], timeout_s: float | None = None) -> 
             tab = context.new_page()
             tabs.append(tab)
             watch(tab, url)
-            tab.goto(url, wait_until="commit", timeout=15000)
+            try:
+                tab.goto(url, wait_until="commit", timeout=GOTO_TAB_TIMEOUT_MS)
+            except Exception:
+                pass
         deadline = time.monotonic() + (GOTO_TIMEOUT_S if timeout_s is None else timeout_s)
         while len(found) < len(urls) and time.monotonic() < deadline:
             tabs[0].wait_for_timeout(250)

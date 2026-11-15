@@ -49,6 +49,21 @@ def test_resolve_deduplicate_and_exclude_ads(page):
     assert page.context.pages == [page]
 
 
+def test_one_stalled_redirect_drops_out_and_the_rest_resolve(page, monkeypatch):
+    monkeypatch.setattr(client, "GOTO_TAB_TIMEOUT_MS", 1000)
+    monkeypatch.setattr(client, "GOTO_TIMEOUT_S", 2.0)
+
+    def goto(route):
+        if route.request.url.endswith("two"):
+            route.fulfill(status=200, content_type="text/html", body=VERIFY % "second")
+
+    page.context.route("https://www.google.com/goto?url=*", goto)
+    page.context.route("https://example.org/**", lambda route: route.abort())
+    data = _extract_results(page, {"anchor": "h3"})
+    assert [r["url"] for r in data["organic"]] == ["https://example.org/second", "https://example.org/first"]
+    assert page.context.pages == [page]
+
+
 def test_unresolved_redirect_is_not_silently_empty(page, monkeypatch):
     monkeypatch.setattr(client, "GOTO_TIMEOUT_S", 1.0)
     page.context.route("https://www.google.com/goto?url=*", lambda route: route.fulfill(status=200, content_type="text/html", body="<p>stuck</p>"))
