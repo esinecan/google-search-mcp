@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from typing import Optional
 
 from mcp.server import MCPServer
@@ -281,6 +282,71 @@ def _transport_security(bind_host: str) -> TransportSecuritySettings | None:
     )
 
 
+MCP_PATH = "/mcp"
+_MISSING_SESSION = (
+    b'{"jsonrpc":"2.0","id":null,"error":{"code":-32600,'
+    b'"message":"Bad Request: Missing session ID"}}'
+)
+
+
+class SessionlessRequestGuard:
+    def __init__(self, app, path: str = MCP_PATH):
+        self.app = app
+        self.path = path
+
+    async def __call__(self, scope, receive, send) -> None:
+        if (
+            scope["type"] == "http"
+            and scope["method"] in ("GET", "DELETE")
+            and scope["path"].rstrip("/") == self.path
+            and not any(name.lower() == b"mcp-session-id" for name, _ in scope.get("headers", []))
+        ):
+            await send({
+                "type": "http.response.start",
+                "status": 400,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(_MISSING_SESSION)).encode()),
+                ],
+            })
+            await send({"type": "http.response.body", "body": _MISSING_SESSION})
+            return
+        await self.app(scope, receive, send)
+
+
+def http_app(host: str):
+    return SessionlessRequestGuard(
+        mcp.streamable_http_app(
+            streamable_http_path=MCP_PATH,
+            transport_security=_transport_security(host),
+            host=host,
+        )
+    )
+
+
+IDLE_PRIORITY_CLASS = 0x40
+BELOW_NORMAL_PRIORITY_CLASS = 0x4000
+NORMAL_PRIORITY_CLASS = 0x20
+
+
+def _leave_background_priority() -> bool:
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.GetPriorityClass.argtypes = [wintypes.HANDLE]
+    kernel32.GetPriorityClass.restype = wintypes.DWORD
+    kernel32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.SetPriorityClass.restype = wintypes.BOOL
+    me = kernel32.GetCurrentProcess()
+    if kernel32.GetPriorityClass(me) not in (IDLE_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS):
+        return False
+    return bool(kernel32.SetPriorityClass(me, NORMAL_PRIORITY_CLASS))
+
+
 def main() -> None:
     """Entry point for the `gsearch-mcp` console script.
 
@@ -311,13 +377,18 @@ def main() -> None:
         return
 
     if transport in ("http", "streamable-http"):
+        import anyio
+        import uvicorn
+
+        _leave_background_priority()
         host = os.environ.get("GOOGLE_MCP_HTTP_HOST", "127.0.0.1")
-        mcp.run(
-            transport="streamable-http",
+        config = uvicorn.Config(
+            http_app(host),
             host=host,
             port=int(os.environ.get("GOOGLE_MCP_HTTP_PORT", "8766")),
-            transport_security=_transport_security(host),
+            log_level=mcp.settings.log_level.lower(),
         )
+        anyio.run(uvicorn.Server(config).serve)
         return
 
     raise SystemExit(

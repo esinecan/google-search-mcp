@@ -53,7 +53,8 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from pathlib import Path
 from typing import Any, Callable
 
@@ -118,6 +119,7 @@ STEALTH = os.environ.get("GOOGLE_MCP_STEALTH", "0") == "1"
 # One thread owns the browser. See module docstring.
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gsearch-browser")
 _lock = threading.Lock()
+BROWSER_CALL_TIMEOUT_S = float(os.environ.get("GOOGLE_MCP_CALL_TIMEOUT_S", "180"))
 
 _pw_cm: Any = None
 _pw: Any = None
@@ -172,12 +174,25 @@ def in_browser_thread(fn: Callable, *args, **kwargs):
     process -- was the 2026-08-23 outage on both the stdio seats and the shared daemon.
     """
     try:
-        return _executor.submit(fn, *args, **kwargs).result()
+        return _await_browser(_executor.submit(fn, *args, **kwargs))
     except Exception as exc:
         if not _looks_like_dead_browser(exc):
             raise
-        _executor.submit(_teardown).result()
-        return _executor.submit(fn, *args, **kwargs).result()
+        _await_browser(_executor.submit(_teardown))
+        return _await_browser(_executor.submit(fn, *args, **kwargs))
+
+
+def _await_browser(future: Future):
+    try:
+        return future.result(timeout=BROWSER_CALL_TIMEOUT_S)
+    except FutureTimeout:
+        future.cancel()
+        err = RateLimited(
+            f"The browser did not finish this call within {BROWSER_CALL_TIMEOUT_S:g} s: it is "
+            "still busy with an earlier call, or the machine is starved of CPU. Back off and retry."
+        )
+        err.detail = {"reason": "browser_busy", "timeout_s": BROWSER_CALL_TIMEOUT_S}
+        raise err from None
 
 
 def profile_dir(name: str = DEFAULT_PROFILE) -> Path:
